@@ -225,13 +225,10 @@ impl<V: Copy> IdMap<V> {
 fn read_pairs(path: &Path) -> Vec<(Vec<u8>, Vec<u8>)> {
     let data = std::fs::read(path).unwrap_or_else(|e| panic!("read {}: {e}", path.display()));
     let mut out = Vec::new();
-    csv::for_lines(&data, 0, data.len(), |buf, p| {
-        let mut f = [(0, 0); 2];
-        let (next, ok) = csv::split::<2>(buf, p, &mut f);
+    csv::scan::<2>(&data, 0, data.len(), |buf, f, ok| {
         if ok && f[0].0 < f[0].1 {
             out.push((buf[f[0].0..f[0].1].to_vec(), buf[f[1].0..f[1].1].to_vec()));
         }
-        next
     });
     out
 }
@@ -591,7 +588,55 @@ fn flush_day(ctx: &Ctx, person: u64, day: usize, sessions: u32, events: u32, rev
 }
 
 // ------------------------------------------------------------------ main
+fn bench(path: &str) {
+    let data = std::fs::read(path).unwrap();
+    let lines = data.iter().filter(|&&c| c == b'\n').count();
+    let run = |name: &str, f: &dyn Fn() -> u64| {
+        let mut best = f64::MAX;
+        let mut acc = 0;
+        for _ in 0..5 {
+            let t = Instant::now();
+            acc = f();
+            best = best.min(t.elapsed().as_secs_f64());
+        }
+        eprintln!("{name:>12}: {:6.1} ns/line  {:5.2} GB/s  ({acc})", best * 1e9 / lines as f64, data.len() as f64 / best / 1e9);
+    };
+    run("newlines", &|| data.iter().filter(|&&c| c == b'\n').count() as u64);
+    run("split", &|| {
+        let mut n = 0u64;
+        csv::scan::<7>(&data, 0, data.len(), |_, f, ok| {
+            n += ok as u64 + f[6].1 as u64;
+        });
+        n
+    });
+    run("split+ts", &|| {
+        let mut n = 0u64;
+        csv::scan::<7>(&data, 0, data.len(), |buf, f, ok| {
+            if ok {
+                n = n.wrapping_add(ts::parse(&buf[f[2].0..f[2].1]).unwrap_or(0) as u64);
+                n = n.wrapping_add(ts::parse(&buf[f[3].0..f[3].1]).unwrap_or(0) as u64);
+            }
+        });
+        n
+    });
+    run("split+keys", &|| {
+        let mut n = 0u64;
+        csv::scan::<7>(&data, 0, data.len(), |buf, f, ok| {
+            if ok && f[0].0 < f[0].1 && f[1].0 < f[1].1 {
+                n = n.wrapping_add(keys::key(&buf[f[0].0..f[0].1]));
+                n = n.wrapping_add(keys::key(&buf[f[1].0..f[1].1]));
+            }
+        });
+        n
+    });
+}
+
 fn main() {
+    let args: Vec<String> = std::env::args().collect();
+    if args.len() == 3 && args[1] == "bench" {
+        bench(&args[2]);
+        return;
+    }
     let t0 = Instant::now();
     let lap = |what: &str| eprintln!("{:>8.1} ms  {what}", t0.elapsed().as_secs_f64() * 1000.0);
     let data = PathBuf::from(std::env::var("DATA_DIR").unwrap_or_else(|_| "/data".into()));
@@ -652,9 +697,7 @@ fn main() {
     par(nthreads, link_tasks.len(), |_| (), |_, ti| {
         let t = &link_tasks[ti];
         let d = link_maps[t.file].bytes();
-        csv::for_lines(d, t.start, t.end, |buf, p| {
-            let mut f = [(0, 0); 2];
-            let (next, ok) = csv::split::<2>(buf, p, &mut f);
+        csv::scan::<2>(d, t.start, t.end, |buf, f, ok| {
             if ok && f[0].0 < f[0].1 && f[1].0 < f[1].1 {
                 let a = keys::key(&buf[f[0].0..f[0].1]);
                 let b = keys::key(&buf[f[1].0..f[1].1]);
@@ -664,7 +707,6 @@ fn main() {
                     links.union(sa, sb);
                 }
             }
-            next
         });
     });
     lap("links: union");
@@ -751,11 +793,9 @@ fn main() {
             if ti < ev_tasks.len() {
                 let t = &ev_tasks[ti];
                 let d = ev_maps[t.file].bytes();
-                csv::for_lines(d, t.start, t.end, |buf, p| {
-                    let mut f = [(0, 0); 7];
-                    let (next, ok) = csv::split::<7>(buf, p, &mut f);
+                csv::scan::<7>(d, t.start, t.end, |buf, f, ok| {
                     if !ok || f[0].0 == f[0].1 {
-                        return next;
+                        return;
                     }
                     let fld = |i: usize| &buf[f[i].0..f[i].1];
                     let ek = keys::key(fld(0));
@@ -797,34 +837,30 @@ fn main() {
                     }
                     let part = (keys::hash(ek) >> (64 - PBITS)) as usize;
                     st.ep[part].push(ERec { eid: ek, person, ingest, ts: tsv, pc });
-                    next
                 });
             } else {
                 let t = &ck_tasks[ti - ev_tasks.len()];
                 let d = ck_maps[t.file].bytes();
-                csv::for_lines(d, t.start, t.end, |buf, p| {
-                    let mut f = [(0, 0); 4];
-                    let (next, ok) = csv::split::<4>(buf, p, &mut f);
+                csv::scan::<4>(d, t.start, t.end, |buf, f, ok| {
                     if !ok || f[0].0 == f[0].1 || f[1].0 == f[1].1 {
-                        return next;
+                        return;
                     }
                     let fld = |i: usize| &buf[f[i].0..f[i].1];
                     let camp = ctx.campaigns.get(fld(2));
                     if camp == u32::MAX {
-                        return next;
+                        return;
                     }
                     let t = match ts::parse(fld(3)) {
                         Some(t) => t,
-                        None => return next,
+                        None => return,
                     };
                     if t < ctx.base || t >= ctx.we {
-                        return next;
+                        return;
                     }
                     let person = links.person(keys::key(fld(1)));
                     let cid = keys::key(fld(0));
                     let part = (keys::hash2(person) >> (64 - QBITS)) as usize;
                     st.cp[part].push(CRec { person, cid, ts: (t - ctx.base) as u32, camp });
-                    next
                 });
             }
         },
