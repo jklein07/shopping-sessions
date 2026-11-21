@@ -84,6 +84,7 @@ mod mapped {
     extern "C" {
         fn mmap(addr: *mut c_void, len: usize, prot: i32, flags: i32, fd: i32, off: i64) -> *mut c_void;
         fn madvise(addr: *mut c_void, len: usize, advice: i32) -> i32;
+        fn munmap(addr: *mut c_void, len: usize) -> i32;
     }
     pub struct Map {
         ptr: *const u8,
@@ -104,6 +105,11 @@ mod mapped {
             }
             unsafe { madvise(p, len, 3) }; // MADV_WILLNEED
             Map { ptr: p as *const u8, len }
+        }
+        pub fn unmap(&self) {
+            if self.len > 0 {
+                unsafe { munmap(self.ptr as *mut c_void, self.len) };
+            }
         }
         pub fn bytes(&self) -> &[u8] {
             unsafe { std::slice::from_raw_parts(self.ptr, self.len) }
@@ -131,13 +137,13 @@ struct Task {
     end: usize,
 }
 
-fn chunk_tasks(maps: &[Map]) -> Vec<Task> {
+fn chunk_tasks(maps: &[Map], chunk: usize) -> Vec<Task> {
     let mut tasks = Vec::new();
     for (i, m) in maps.iter().enumerate() {
         let len = m.bytes().len();
         let mut s = 0;
         while s < len {
-            let e = (s + CHUNK).min(len);
+            let e = (s + chunk).min(len);
             tasks.push(Task { file: i, start: s, end: e });
             s = e;
         }
@@ -896,7 +902,7 @@ fn main() {
     let link_maps = &maps[nev + nck..];
     let link_bytes: usize = link_maps.iter().map(|m| m.bytes().len()).sum();
     let links = LinkTable::new(link_bytes / 20 * 2 * 13 / 10 + 1024);
-    let link_tasks = chunk_tasks(link_maps);
+    let link_tasks = chunk_tasks(link_maps, (link_bytes / (nthreads * 16)).clamp(64 << 10, CHUNK));
     par(nthreads, link_tasks.len(), |_| (), |_, ti| {
         let t = &link_tasks[ti];
         let d = link_maps[t.file].bytes();
@@ -972,8 +978,8 @@ fn main() {
     // ---- B: parse events and clicks
     let ev_maps = &maps[..nev];
     let ck_maps = &maps[nev..nev + nck];
-    let ev_tasks = chunk_tasks(ev_maps);
-    let ck_tasks = chunk_tasks(ck_maps);
+    let ev_tasks = chunk_tasks(ev_maps, CHUNK);
+    let ck_tasks = chunk_tasks(ck_maps, CHUNK);
     let ev_bytes: usize = ev_maps.iter().map(|m| m.bytes().len()).sum();
     let ck_bytes: usize = ck_maps.iter().map(|m| m.bytes().len()).sum();
     let np = 1usize << PBITS;
@@ -1203,6 +1209,13 @@ fn main() {
 
     // ---- D: sessions per person partition
     let ncamp = ctx.camp_ids.len() + 1;
+    // largest partitions first, so a whale's partition does not finish last
+    let mut order: Vec<usize> = (0..nq).collect();
+    let psize = |q: usize| -> usize {
+        cstates.iter().map(|s| s.pp[q].len()).sum::<usize>() + bstates.iter().map(|s| s.cp[q].len()).sum::<usize>()
+    };
+    let sizes: Vec<usize> = (0..nq).map(psize).collect();
+    order.sort_unstable_by_key(|&q| std::cmp::Reverse(sizes[q]));
     let dstates = par(
         nthreads,
         nq,
@@ -1222,7 +1235,8 @@ fn main() {
             day_end: Vec::new(),
             camp_ts: Vec::new(),
         },
-        |st, q| {
+        |st, qi| {
+            let q = order[qi];
             let mut sc = st.scratch.take().unwrap();
             let slices: Vec<&[PRec]> = cstates.iter().map(|s| &s.pp[q][..]).collect();
             let n: usize = slices.iter().map(|s| s.len()).sum();
@@ -1398,6 +1412,19 @@ fn main() {
         parquet::write(&cd.join("part-00000.parquet"), rows, &cols).expect("write campaign_daily");
     }
     lap("write");
+    if std::env::var("SS_FREE").is_ok() {
+        // diagnostics: what the kernel's teardown at exit costs, piece by piece
+        drop(cstates);
+        lap("free PRec");
+        drop(bstates);
+        lap("free ERec+CRec");
+        drop(dstates);
+        lap("free D");
+        for m in &maps {
+            m.unmap();
+        }
+        lap("unmap files");
+    }
     // The OS reclaims everything; skip destructors of the big buffers.
     std::process::exit(0);
 }
