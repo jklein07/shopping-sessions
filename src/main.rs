@@ -274,6 +274,21 @@ fn zeroed_atomic_u32(n: usize) -> Vec<AtomicU32> {
     unsafe { Vec::from_raw_parts(v.as_ptr() as *mut AtomicU32, v.len(), v.capacity()) }
 }
 
+#[inline(always)]
+fn prefetch(p: *const u8) {
+    #[cfg(target_arch = "x86_64")]
+    unsafe {
+        std::arch::x86_64::_mm_prefetch(p as *const i8, std::arch::x86_64::_MM_HINT_T0)
+    }
+    #[cfg(target_arch = "aarch64")]
+    unsafe {
+        std::arch::asm!("prfm pldl1keep, [{0}]", in(reg) p, options(nostack, readonly, preserves_flags))
+    }
+}
+
+/// Lookups wait in a ring this many lines after their prefetch.
+const RING: usize = 16;
+
 impl LinkTable {
     fn new(min_cap: usize) -> Self {
         let cap = min_cap.next_power_of_two().max(1024);
@@ -333,10 +348,13 @@ impl LinkTable {
             }
         }
     }
-    /// The person (name key) of an ID key.
     #[inline(always)]
-    fn person(&self, k: u64) -> u64 {
-        let mut i = self.home(k);
+    fn prefetch(&self, slot: usize) {
+        prefetch(self.slots.as_ptr().wrapping_add(2 * slot) as *const u8);
+    }
+    /// The person (name key) of the ID key `k`, probing from slot `i`.
+    #[inline(always)]
+    fn person_at(&self, mut i: usize, k: u64) -> u64 {
         loop {
             let cur = self.slots[2 * i].load(Relaxed);
             if cur == k {
@@ -588,6 +606,22 @@ fn flush_day(ctx: &Ctx, person: u64, day: usize, sessions: u32, events: u32, rev
 }
 
 // ------------------------------------------------------------------ main
+/// User + system CPU seconds of the whole process so far.
+fn cpu_seconds() -> f64 {
+    #[repr(C)]
+    struct Rusage {
+        utime: [i64; 2],
+        stime: [i64; 2],
+        rest: [i64; 14],
+    }
+    extern "C" {
+        fn getrusage(who: i32, usage: *mut Rusage) -> i32;
+    }
+    let mut r = Rusage { utime: [0; 2], stime: [0; 2], rest: [0; 14] };
+    unsafe { getrusage(0, &mut r) };
+    (r.utime[0] + r.stime[0]) as f64 + (r.utime[1] + r.stime[1]) as f64 * 1e-6
+}
+
 fn bench(path: &str) {
     let data = std::fs::read(path).unwrap();
     let lines = data.iter().filter(|&&c| c == b'\n').count();
@@ -638,7 +672,12 @@ fn main() {
         return;
     }
     let t0 = Instant::now();
-    let lap = |what: &str| eprintln!("{:>8.1} ms  {what}", t0.elapsed().as_secs_f64() * 1000.0);
+    let last_cpu = std::cell::Cell::new(cpu_seconds());
+    let lap = |what: &str| {
+        let c = cpu_seconds();
+        eprintln!("{:>8.1} ms  {:>7.1} cpu-ms  {what}", t0.elapsed().as_secs_f64() * 1000.0, (c - last_cpu.get()) * 1000.0);
+        last_cpu.set(c);
+    };
     let data = PathBuf::from(std::env::var("DATA_DIR").unwrap_or_else(|_| "/data".into()));
     let out = PathBuf::from(std::env::var("OUTPUT_DIR").unwrap_or_else(|_| "/output".into()));
     let nthreads: usize = std::env::var("NCPU")
@@ -780,7 +819,61 @@ fn main() {
     struct BState {
         ep: Vec<Vec<ERec>>,
         cp: Vec<Vec<CRec>>,
+        ering: [(ERec, usize); RING],
+        en: usize,
+        cring: [(CRec, usize); RING],
+        cn: usize,
     }
+    impl BState {
+        /// Queue an event whose `person` holds the user's ID key; resolve the oldest.
+        #[inline(always)]
+        fn event(&mut self, links: &LinkTable, r: ERec) {
+            let slot = links.home(r.person);
+            links.prefetch(slot);
+            let i = self.en % RING;
+            if self.en >= RING {
+                let (mut old, oslot) = self.ering[i];
+                old.person = links.person_at(oslot, old.person);
+                self.ep[(keys::hash(old.eid) >> (64 - PBITS)) as usize].push(old);
+            }
+            self.ering[i] = (r, slot);
+            self.en += 1;
+        }
+        #[inline(always)]
+        fn click(&mut self, links: &LinkTable, r: CRec) {
+            let slot = links.home(r.person);
+            links.prefetch(slot);
+            let i = self.cn % RING;
+            if self.cn >= RING {
+                let (old, oslot) = self.cring[i];
+                self.push_click(links, old, oslot);
+            }
+            self.cring[i] = (r, slot);
+            self.cn += 1;
+        }
+        #[inline(always)]
+        fn push_click(&mut self, links: &LinkTable, mut c: CRec, slot: usize) {
+            c.person = links.person_at(slot, c.person);
+            self.cp[(keys::hash2(c.person) >> (64 - QBITS)) as usize].push(c);
+        }
+        fn flush(&mut self, links: &LinkTable) {
+            let n = self.en.min(RING);
+            for k in 0..n {
+                let (mut old, oslot) = self.ering[(self.en - n + k) % RING];
+                old.person = links.person_at(oslot, old.person);
+                self.ep[(keys::hash(old.eid) >> (64 - PBITS)) as usize].push(old);
+            }
+            self.en = 0;
+            let n = self.cn.min(RING);
+            for k in 0..n {
+                let (old, oslot) = self.cring[(self.cn - n + k) % RING];
+                self.push_click(links, old, oslot);
+            }
+            self.cn = 0;
+        }
+    }
+    const E0: ERec = ERec { eid: 0, person: 0, ingest: 0, ts: 0, pc: 0 };
+    const C0: CRec = CRec { person: 0, cid: 0, ts: 0, camp: 0 };
     let ntasks = ev_tasks.len() + ck_tasks.len();
     let bstates = par(
         nthreads,
@@ -788,6 +881,10 @@ fn main() {
         |_| BState {
             ep: (0..np).map(|_| Vec::with_capacity(ev_reserve)).collect(),
             cp: (0..nq).map(|_| Vec::with_capacity(ck_reserve)).collect(),
+            ering: [(E0, 0); RING],
+            en: 0,
+            cring: [(C0, 0); RING],
+            cn: 0,
         },
         |st, ti| {
             if ti < ev_tasks.len() {
@@ -802,7 +899,7 @@ fn main() {
                     let ingest = ts::parse(fld(3)).unwrap_or(i64::MAX);
                     let mut tsv = INVALID;
                     let mut pc = 0u32;
-                    let mut person = 0u64;
+                    let mut uk = 0u64;
                     'v: {
                         let uid = fld(1);
                         let pid = fld(5);
@@ -833,11 +930,16 @@ fn main() {
                         let cat = ctx.products.get(pid);
                         tsv = (t - ctx.base) as u32;
                         pc = (price << 8) | cat as u32;
-                        person = links.person(keys::key(uid));
+                        uk = keys::key(uid);
                     }
-                    let part = (keys::hash(ek) >> (64 - PBITS)) as usize;
-                    st.ep[part].push(ERec { eid: ek, person, ingest, ts: tsv, pc });
+                    let r = ERec { eid: ek, person: uk, ingest, ts: tsv, pc };
+                    if tsv != INVALID {
+                        st.event(&links, r);
+                    } else {
+                        st.ep[(keys::hash(ek) >> (64 - PBITS)) as usize].push(r);
+                    }
                 });
+                st.flush(&links);
             } else {
                 let t = &ck_tasks[ti - ev_tasks.len()];
                 let d = ck_maps[t.file].bytes();
@@ -857,11 +959,11 @@ fn main() {
                     if t < ctx.base || t >= ctx.we {
                         return;
                     }
-                    let person = links.person(keys::key(fld(1)));
+                    let uk = keys::key(fld(1));
                     let cid = keys::key(fld(0));
-                    let part = (keys::hash2(person) >> (64 - QBITS)) as usize;
-                    st.cp[part].push(CRec { person, cid, ts: (t - ctx.base) as u32, camp });
+                    st.click(&links, CRec { person: uk, cid, ts: (t - ctx.base) as u32, camp });
                 });
+                st.flush(&links);
             }
         },
     );
