@@ -117,8 +117,27 @@ mod mapped {
             unsafe { std::slice::from_raw_parts(self.ptr, self.len) }
         }
     }
+
+    /// Give the whole pages inside a buffer that is never read again back to the kernel now, on this
+    /// thread, so the exit (which frees memory on one core) has less to do. Linux only.
+    #[inline]
+    pub fn release<T>(v: &Vec<T>) {
+        #[cfg(target_os = "linux")]
+        {
+            const PAGE: usize = 4096;
+            let start = v.as_ptr() as usize;
+            let end = start + v.capacity() * std::mem::size_of::<T>();
+            let a = (start + PAGE - 1) & !(PAGE - 1);
+            let b = end & !(PAGE - 1);
+            if b > a {
+                unsafe { madvise(a as *mut c_void, b - a, 4) }; // MADV_DONTNEED
+            }
+        }
+        #[cfg(not(target_os = "linux"))]
+        let _ = v;
+    }
 }
-use mapped::Map;
+use mapped::{release, Map};
 
 fn csv_files(dir: &Path) -> Vec<PathBuf> {
     let mut v: Vec<PathBuf> = match std::fs::read_dir(dir) {
@@ -755,6 +774,22 @@ fn cpu_seconds() -> f64 {
     (r.utime[0] + r.stime[0]) as f64 + (r.utime[1] + r.stime[1]) as f64 * 1e-6
 }
 
+/// System CPU seconds of the whole process so far.
+fn sys_seconds() -> f64 {
+    #[repr(C)]
+    struct Rusage {
+        utime: [i64; 2],
+        stime: [i64; 2],
+        rest: [i64; 14],
+    }
+    extern "C" {
+        fn getrusage(who: i32, usage: *mut Rusage) -> i32;
+    }
+    let mut r = Rusage { utime: [0; 2], stime: [0; 2], rest: [0; 14] };
+    unsafe { getrusage(0, &mut r) };
+    r.stime[0] as f64 + r.stime[1] as f64 * 1e-6
+}
+
 fn bench(path: &str) {
     let data = std::fs::read(path).unwrap();
     let lines = data.iter().filter(|&&c| c == b'\n').count();
@@ -804,7 +839,7 @@ fn bench(path: &str) {
     for (name, level) in [("handler", 0u32), ("+push", 1), ("-ingest", 2), ("-ts", 3), ("-product", 4)] {
         let products = &products;
         run(name, &|| {
-            let mut parts: Vec<Vec<ERec>> = (0..512).map(|_| Vec::with_capacity(64)).collect();
+            let mut parts: Vec<Vec<ERec>> = (0..1usize << PBITS).map(|_| Vec::with_capacity(64)).collect();
             let mut acc = 0u64;
             csv::scan::<7>(&data, 0, data.len(), |buf, f, ok| {
                 if !ok || f[0].0 == f[0].1 {
@@ -858,10 +893,18 @@ fn main() {
     }
     let t0 = Instant::now();
     let last_cpu = std::cell::Cell::new(cpu_seconds());
+    let last_sys = std::cell::Cell::new(sys_seconds());
     let lap = |what: &str| {
         let c = cpu_seconds();
-        eprintln!("{:>8.1} ms  {:>7.1} cpu-ms  {what}", t0.elapsed().as_secs_f64() * 1000.0, (c - last_cpu.get()) * 1000.0);
+        let s = sys_seconds();
+        eprintln!(
+            "{:>8.1} ms  {:>7.1} cpu-ms ({:>6.1} sys)  {what}",
+            t0.elapsed().as_secs_f64() * 1000.0,
+            (c - last_cpu.get()) * 1000.0,
+            (s - last_sys.get()) * 1000.0
+        );
         last_cpu.set(c);
+        last_sys.set(s);
     };
     let data = PathBuf::from(std::env::var("DATA_DIR").unwrap_or_else(|_| "/data".into()));
     let out = PathBuf::from(std::env::var("OUTPUT_DIR").unwrap_or_else(|_| "/output".into()));
@@ -1230,6 +1273,9 @@ fn main() {
                 }
             }
             st.touched.clear();
+            for s in &bstates {
+                release(&s.ep[p]);
+            }
         },
     );
     lap("dedup");
@@ -1347,6 +1393,12 @@ fn main() {
                 }
                 process_person(&ctx, sc.names[l], e, c, st);
             }
+            for s in &cstates {
+                release(&s.pp[q]);
+            }
+            for s in &bstates {
+                release(&s.cp[q]);
+            }
             st.scratch = Some(sc);
         },
     );
@@ -1387,6 +1439,14 @@ fn main() {
             Column { name: "top_category", logical: Logical::String, values: Values::Str { bytes: tops, ends: tend }, present: Some(present) },
         ];
         parquet::write(&ud.join(format!("part-{fi:05}.parquet")), rows.len(), &cols).expect("write user_daily");
+        drop(cols);
+        release(rows);
+        if let Some(sc) = &dstates[files[fi]].scratch {
+            release(&sc.ev);
+            release(&sc.lid);
+            release(&sc.ck);
+            release(&sc.clid);
+        }
     });
     {
         let mut cs = vec![0u64; ncamp * ndays];
