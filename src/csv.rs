@@ -139,22 +139,42 @@ fn line_fast<const N: usize>(data: &[u8], ls: usize, f: &mut Fields<N>) -> Optio
         }
         return Some((next, true));
     }
-    let mut start = 0u32;
-    let mut bad = false;
+    // Quoted fields, without a per-field loop over quote ranges. A line is well formed when
+    // (a) every quote is the first or the last byte of its field, and (b) every field holds an
+    // even number of quotes (the quote parity is even at each separator). Then each field has
+    // either no quote, or exactly two: its first and last byte (a 1-byte field cannot hold two).
+    let upto = below | (1u128 << end); // positions 0..=end
+    let starts = ((sep << 1) | 1) & upto; // first byte of each field (= its separator if empty)
+    let ends = sep >> 1; // last byte of each non-empty field (and some separators, harmless)
+    let (ql, qh) = (q as u64, (q >> 64) as u64);
+    let pl = prefix_xor(ql);
+    let ph = prefix_xor(qh) ^ 0u64.wrapping_sub(pl >> 63);
+    let parity = pl as u128 | (ph as u128) << 64;
+    let ok = q & !(starts | ends) == 0 && parity & sep == 0;
+    let open = q & starts;
+    let close = q & ends;
+    let mut a = (starts & !open) | (open << 1);
+    let mut b = (sep & !(close << 1)) | close;
     for fi in f.iter_mut() {
-        let p = sep.trailing_zeros();
-        sep &= sep - 1;
-        // quotes inside [start, p)
-        let range = ((1u128 << p) - 1) & !((1u128 << start) - 1);
-        let inner = q & range;
-        let quoted = inner != 0;
-        let edges = (1u128 << start) | (1u128 << p.saturating_sub(1));
-        bad |= quoted & (inner != edges || p < start + 2);
-        let d = quoted as u32;
-        *fi = (ls + (start + d) as usize, ls + (p - d.min(p)) as usize);
-        start = p + 1;
+        let x = a.trailing_zeros();
+        let y = b.trailing_zeros();
+        a &= a.wrapping_sub(1);
+        b &= b.wrapping_sub(1);
+        *fi = (ls + x as usize, ls + y as usize);
     }
-    Some((next, !bad))
+    Some((next, ok))
+}
+
+/// Bit i of the result: XOR of bits 0..=i of x.
+#[inline(always)]
+fn prefix_xor(mut x: u64) -> u64 {
+    x ^= x << 1;
+    x ^= x << 2;
+    x ^= x << 4;
+    x ^= x << 8;
+    x ^= x << 16;
+    x ^= x << 32;
+    x
 }
 
 /// The general path: any line length, and a last line without `\n`.
@@ -244,6 +264,80 @@ mod tests {
         assert_eq!(sp::<2>(b" a ,\" b\""), Some(vec![b" a ".to_vec(), b" b".to_vec()]));
         assert_eq!(sp::<2>(b"a,b\r"), Some(vec![b"a".to_vec(), b"b\r".to_vec()]));
         assert_eq!(sp::<2>(b","), Some(vec![b"".to_vec(), b"".to_vec()]));
+    }
+    fn diff<const N: usize>(iters: usize, seed: u64) {
+        let mut st = seed;
+        let mut rnd = move || {
+            st ^= st << 13;
+            st ^= st >> 7;
+            st ^= st << 17;
+            st
+        };
+        let alpha = b"ab,,\"\"\" \r";
+        let mut fa: Fields<N> = [(0, 0); N];
+        let mut valid = 0usize;
+        let mut fb: Fields<N> = [(0, 0); N];
+        for it in 0..iters {
+            let mut buf: Vec<u8> = if it % 2 == 0 {
+                let len = (rnd() % 140) as usize;
+                (0..len).map(|_| alpha[(rnd() % alpha.len() as u64) as usize]).collect()
+            } else {
+                // field by field: mostly the right count, plain or quoted, sometimes corrupted
+                let nf = match rnd() % 8 {
+                    0 => N.saturating_sub(1).max(1),
+                    1 => N + 1,
+                    _ => N,
+                };
+                let mut v = Vec::new();
+                for k in 0..nf {
+                    if k > 0 {
+                        v.push(b',');
+                    }
+                    let flen = (rnd() % 12) as usize;
+                    let body: Vec<u8> = (0..flen).map(|_| b"ab \r"[(rnd() % 4) as usize]).collect();
+                    match rnd() % (6 * N as u64) {
+                        0 => {
+                            let mut b2 = body.clone();
+                            let at = (rnd() as usize) % (b2.len() + 1);
+                            b2.insert(at, b'"');
+                            if rnd() % 2 == 0 {
+                                b2.insert(0, b'"');
+                            }
+                            v.extend_from_slice(&b2);
+                        }
+                        x if x % 2 == 0 => v.extend_from_slice(&body),
+                        _ => {
+                            v.push(b'"');
+                            v.extend_from_slice(&body);
+                            v.push(b'"');
+                        }
+                    }
+                }
+                v
+            };
+            let len = buf.len();
+            buf.push(b'\n');
+            buf.extend(std::iter::repeat(b'x').take(130));
+            if let Some((na, oka)) = line_fast::<N>(&buf, 0, &mut fa) {
+                let (nb, okb) = line_slow::<N>(&buf, 0, &mut fb);
+                assert_eq!((na, oka), (nb, okb), "{:?}", String::from_utf8_lossy(&buf[..len]));
+                if oka {
+                    valid += 1;
+                    assert_eq!(fa, fb, "{:?}", String::from_utf8_lossy(&buf[..len]));
+                }
+            } else {
+                assert!(len >= 128);
+            }
+        }
+        assert!(valid > iters / 20, "only {valid} well-formed lines");
+    }
+    #[test]
+    fn fast_matches_slow() {
+        diff::<1>(300_000, 1);
+        diff::<2>(1_000_000, 2);
+        diff::<4>(1_000_000, 3);
+        diff::<7>(1_000_000, 4);
+        diff::<12>(300_000, 5);
     }
     #[test]
     fn chunks_and_tail() {
