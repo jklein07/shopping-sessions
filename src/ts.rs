@@ -93,6 +93,148 @@ fn pairs(x: u64) -> u64 {
 /// Seconds since the epoch of the `YYYY-MM-DDTHH:MM:SS` prefix (needs 20 bytes).
 #[inline(always)]
 fn civil_prefix(s: &[u8]) -> Option<i64> {
+    #[cfg(any(target_arch = "aarch64", all(target_arch = "x86_64", target_feature = "ssse3")))]
+    {
+        simd::civil_prefix(s)
+    }
+    #[cfg(not(any(target_arch = "aarch64", all(target_arch = "x86_64", target_feature = "ssse3"))))]
+    {
+        civil_prefix_swar(s)
+    }
+}
+
+/// Days since the epoch of a date whose fields are digits with 1 <= mo <= 12 and d >= 1,
+/// or None if the day is past the end of the month.
+#[inline(always)]
+fn days_checked(y: i64, mo: i64, d: i64) -> Option<i64> {
+    let i = (y - Y0) * 12 + mo - 1;
+    if (i as u64) < (YEARS * 12) as u64 {
+        let m0 = MONTH_START[i as usize] as i64;
+        let m1 = MONTH_START[i as usize + 1] as i64;
+        if d > m1 - m0 {
+            return None;
+        }
+        return Some(m0 + d - 1);
+    }
+    civil_days(y, mo, d)
+}
+
+#[cfg(target_arch = "aarch64")]
+mod simd {
+    use std::arch::aarch64::*;
+
+    const D: u8 = 0xFF; // a digit lane
+    /// Lanes of bytes 0..16 that hold digits; the rest are separators.
+    static DIG_V: [u8; 16] = [D, D, D, D, 0, D, D, 0, D, D, 0, D, D, 0, D, D];
+    static SEP_V: [u8; 16] = [0, 0, 0, 0, b'-', 0, 0, b'-', 0, 0, b'T', 0, 0, b':', 0, 0];
+    /// Lanes of bytes 4..20: byte 16 is ':', bytes 17..19 digits; the rest were checked in v
+    /// (or, byte 19, by the caller).
+    static DIG_W: [u8; 16] = [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, D, D, 0];
+    static SEP_W: [u8; 16] = [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, b':', 0, 0, 0];
+    static FREE_W: [u8; 16] = [D, D, D, D, D, D, D, D, D, D, D, D, 0, 0, 0, D];
+    /// The 14 digits, in pairs: from v (0..16) and w (16..32).
+    static GATHER: [u8; 16] = [0, 1, 2, 3, 5, 6, 8, 9, 11, 12, 14, 15, 29, 30, 255, 255];
+    static TEN_ONE: [u8; 16] = [10, 1, 10, 1, 10, 1, 10, 1, 10, 1, 10, 1, 10, 1, 0, 0];
+    /// Largest allowed value of each pair: year (2), month, day (checked later), hour, minute, second.
+    static MAX: [u16; 8] = [99, 99, 12, 31, 23, 59, 59, 0];
+    static MIN: [u16; 8] = [0, 0, 1, 1, 0, 0, 0, 0];
+
+    #[inline(always)]
+    pub fn civil_prefix(s: &[u8]) -> Option<i64> {
+        let s: &[u8; 20] = s[..20].try_into().unwrap();
+        // SAFETY: both 16-byte loads lie inside the 20-byte array; the statics are 16 bytes.
+        unsafe {
+            let v = vld1q_u8(s.as_ptr());
+            let w = vld1q_u8(s.as_ptr().add(4));
+            let zero = vdupq_n_u8(b'0');
+            let nine = vdupq_n_u8(9);
+            let dv = vsubq_u8(v, zero);
+            let dw = vsubq_u8(w, zero);
+            let ok_v = vbslq_u8(vld1q_u8(DIG_V.as_ptr()), vcleq_u8(dv, nine), vceqq_u8(v, vld1q_u8(SEP_V.as_ptr())));
+            let ok_w = vbslq_u8(vld1q_u8(DIG_W.as_ptr()), vcleq_u8(dw, nine), vceqq_u8(w, vld1q_u8(SEP_W.as_ptr())));
+            let ok = vandq_u8(ok_v, vorrq_u8(ok_w, vld1q_u8(FREE_W.as_ptr())));
+            let g = vqtbl2q_u8(uint8x16x2_t(dv, dw), vld1q_u8(GATHER.as_ptr()));
+            let p = vpaddlq_u8(vmulq_u8(g, vld1q_u8(TEN_ONE.as_ptr())));
+            let out = vorrq_u16(vcgtq_u16(p, vld1q_u16(MAX.as_ptr())), vcltq_u16(p, vld1q_u16(MIN.as_ptr())));
+            // one test for both: any separator/digit lane failed, or any field out of range
+            let bad = vminvq_u8(ok) != 0xFF;
+            let range_bad = vmaxvq_u16(out) != 0;
+            if bad | range_bad {
+                return None;
+            }
+            let pv = vreinterpretq_u64_u16(p);
+            let x0 = vgetq_lane_u64(pv, 0);
+            let x1 = vgetq_lane_u64(pv, 1);
+            let y = ((x0 & 0xFFFF) * 100 + ((x0 >> 16) & 0xFFFF)) as i64;
+            let mo = ((x0 >> 32) & 0xFFFF) as i64;
+            let d = (x0 >> 48) as i64;
+            let h = (x1 & 0xFFFF) as i64;
+            let mi = ((x1 >> 16) & 0xFFFF) as i64;
+            let se = ((x1 >> 32) & 0xFFFF) as i64;
+            let days = super::days_checked(y, mo, d)?;
+            Some(((days * 24 + h) * 60 + mi) * 60 + se)
+        }
+    }
+}
+
+#[cfg(all(target_arch = "x86_64", target_feature = "ssse3"))]
+mod simd {
+    use std::arch::x86_64::*;
+
+    #[inline(always)]
+    pub fn civil_prefix(s: &[u8]) -> Option<i64> {
+        let s: &[u8; 20] = s[..20].try_into().unwrap();
+        // SAFETY: both 16-byte loads lie inside the 20-byte array; SSSE3 is enabled at build time.
+        unsafe {
+            const D: i8 = -1; // a digit lane
+            let v = _mm_loadu_si128(s.as_ptr() as *const __m128i); // bytes 0..16
+            let w = _mm_loadu_si128(s.as_ptr().add(4) as *const __m128i); // bytes 4..20
+            let zero = _mm_set1_epi8(b'0' as i8);
+            let nine = _mm_set1_epi8(9);
+            let dv = _mm_sub_epi8(v, zero);
+            let dw = _mm_sub_epi8(w, zero);
+            let digit_v = _mm_cmpeq_epi8(_mm_max_epu8(dv, nine), nine);
+            let digit_w = _mm_cmpeq_epi8(_mm_max_epu8(dw, nine), nine);
+            let dig_v = _mm_setr_epi8(D, D, D, D, 0, D, D, 0, D, D, 0, D, D, 0, D, D);
+            let sep_v = _mm_setr_epi8(0, 0, 0, 0, b'-' as i8, 0, 0, b'-' as i8, 0, 0, b'T' as i8, 0, 0, b':' as i8, 0, 0);
+            let dig_w = _mm_setr_epi8(0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, D, D, 0);
+            let sep_w = _mm_setr_epi8(0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, b':' as i8, 0, 0, 0);
+            let free_w = _mm_setr_epi8(D, D, D, D, D, D, D, D, D, D, D, D, 0, 0, 0, D);
+            let ok_v = _mm_or_si128(_mm_and_si128(dig_v, digit_v), _mm_andnot_si128(dig_v, _mm_cmpeq_epi8(v, sep_v)));
+            let ok_w = _mm_or_si128(_mm_and_si128(dig_w, digit_w), _mm_andnot_si128(dig_w, _mm_cmpeq_epi8(w, sep_w)));
+            let ok = _mm_and_si128(ok_v, _mm_or_si128(ok_w, free_w));
+            // the 14 digits in pairs: 12 from v, the seconds from w
+            const X: i8 = -128; // pshufb: zero this lane
+            let g = _mm_or_si128(
+                _mm_shuffle_epi8(dv, _mm_setr_epi8(0, 1, 2, 3, 5, 6, 8, 9, 11, 12, 14, 15, X, X, X, X)),
+                _mm_shuffle_epi8(dw, _mm_setr_epi8(X, X, X, X, X, X, X, X, X, X, X, X, 13, 14, X, X)),
+            );
+            let p = _mm_maddubs_epi16(g, _mm_setr_epi8(10, 1, 10, 1, 10, 1, 10, 1, 10, 1, 10, 1, 10, 1, 0, 0));
+            // fields: year (2), month, day (checked later), hour, minute, second
+            let max = _mm_setr_epi16(99, 99, 12, 31, 23, 59, 59, 0);
+            let min = _mm_setr_epi16(0, 0, 1, 1, 0, 0, 0, 0);
+            let out = _mm_or_si128(_mm_cmpgt_epi16(p, max), _mm_cmpgt_epi16(min, p));
+            if (_mm_movemask_epi8(ok) != 0xFFFF) | (_mm_movemask_epi8(out) != 0) {
+                return None;
+            }
+            let x0 = _mm_cvtsi128_si64(p) as u64;
+            let x1 = _mm_cvtsi128_si64(_mm_unpackhi_epi64(p, p)) as u64;
+            let y = ((x0 & 0xFFFF) * 100 + ((x0 >> 16) & 0xFFFF)) as i64;
+            let mo = ((x0 >> 32) & 0xFFFF) as i64;
+            let d = (x0 >> 48) as i64;
+            let h = (x1 & 0xFFFF) as i64;
+            let mi = ((x1 >> 16) & 0xFFFF) as i64;
+            let se = ((x1 >> 32) & 0xFFFF) as i64;
+            let days = super::days_checked(y, mo, d)?;
+            Some(((days * 24 + h) * 60 + mi) * 60 + se)
+        }
+    }
+}
+
+/// The scalar (SWAR) version of `civil_prefix`.
+#[inline(always)]
+#[allow(dead_code)]
+fn civil_prefix_swar(s: &[u8]) -> Option<i64> {
     let a = le8(s, 0); // YYYY-MM-
     let b = le8(s, 8); // DDTHH:MM
     let c = u32::from_le_bytes(s[16..20].try_into().unwrap()) as u64; // :SS?
@@ -270,6 +412,27 @@ mod tests {
         assert_eq!(parse(b"179102160000000000000"), Some(i64::MAX));
         assert_eq!(parse(b"86400000"), Some(86400000));
         assert_eq!(parse(b"0"), Some(0));
+    }
+
+    #[test]
+    fn prefix_simd_matches_swar() {
+        let mut x: u64 = 0x2545_f491_4f6c_dd1d;
+        let mut next = || {
+            x ^= x << 13;
+            x ^= x >> 7;
+            x ^= x << 17;
+            x
+        };
+        let alphabet = b"0123456789-T:Z+ z./\x80\xff";
+        for _ in 0..3_000_000 {
+            let r = next();
+            let mut s = format!("{:04}-{:02}-{:02}T{:02}:{:02}:{:02}Z", r % 10000, (r >> 14) % 14, (r >> 18) % 33, (r >> 24) % 26, (r >> 30) % 62, (r >> 36) % 62).into_bytes();
+            for _ in 0..(next() % 3) {
+                let i = (next() as usize) % s.len();
+                s[i] = alphabet[(next() as usize) % alphabet.len()];
+            }
+            assert_eq!(civil_prefix(&s), civil_prefix_swar(&s), "{:?}", String::from_utf8_lossy(&s));
+        }
     }
 
     #[test]
