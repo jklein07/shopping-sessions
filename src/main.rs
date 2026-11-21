@@ -89,6 +89,7 @@ mod mapped {
     pub struct Map {
         ptr: *const u8,
         len: usize,
+        unmapped: std::sync::atomic::AtomicBool,
     }
     unsafe impl Send for Map {}
     unsafe impl Sync for Map {}
@@ -97,17 +98,18 @@ mod mapped {
             let f = std::fs::File::open(path).unwrap_or_else(|e| panic!("open {}: {e}", path.display()));
             let len = f.metadata().unwrap().len() as usize;
             if len == 0 {
-                return Map { ptr: std::ptr::NonNull::<u8>::dangling().as_ptr(), len: 0 };
+                return Map { ptr: std::ptr::NonNull::<u8>::dangling().as_ptr(), len: 0, unmapped: false.into() };
             }
             let p = unsafe { mmap(std::ptr::null_mut(), len, 1, 2, f.as_raw_fd(), 0) };
             if p as isize == -1 {
                 panic!("mmap {}", path.display());
             }
             unsafe { madvise(p, len, 3) }; // MADV_WILLNEED
-            Map { ptr: p as *const u8, len }
+            Map { ptr: p as *const u8, len, unmapped: false.into() }
         }
+        /// Unmap once; the bytes must not be used afterwards.
         pub fn unmap(&self) {
-            if self.len > 0 {
+            if self.len > 0 && !self.unmapped.swap(true, std::sync::atomic::Ordering::AcqRel) {
                 unsafe { munmap(self.ptr as *mut c_void, self.len) };
             }
         }
@@ -149,6 +151,25 @@ fn chunk_tasks(maps: &[Map], chunk: usize) -> Vec<Task> {
         }
     }
     tasks
+}
+
+/// Unmaps each file when the last of its chunk tasks is done, so the page
+/// tables are torn down in parallel by the workers, not at process exit.
+struct Countdown(Vec<AtomicUsize>);
+
+impl Countdown {
+    fn new(nfiles: usize, tasks: &[Task]) -> Self {
+        let c: Vec<AtomicUsize> = (0..nfiles).map(|_| AtomicUsize::new(0)).collect();
+        for t in tasks {
+            c[t.file].fetch_add(1, Relaxed);
+        }
+        Countdown(c)
+    }
+    fn done(&self, file: usize, maps: &[Map]) {
+        if self.0[file].fetch_sub(1, AcqRel) == 1 {
+            maps[file].unmap();
+        }
+    }
 }
 
 // ------------------------------------------------------------------ parallel helper
@@ -903,6 +924,7 @@ fn main() {
     let link_bytes: usize = link_maps.iter().map(|m| m.bytes().len()).sum();
     let links = LinkTable::new(link_bytes / 20 * 2 * 13 / 10 + 1024);
     let link_tasks = chunk_tasks(link_maps, (link_bytes / (nthreads * 16)).clamp(64 << 10, CHUNK));
+    let link_left = Countdown::new(link_maps.len(), &link_tasks);
     par(nthreads, link_tasks.len(), |_| (), |_, ti| {
         let t = &link_tasks[ti];
         let d = link_maps[t.file].bytes();
@@ -917,6 +939,7 @@ fn main() {
                 }
             }
         });
+        link_left.done(t.file, link_maps);
     });
     lap("links: union");
     let cap = links.mask + 1;
@@ -980,6 +1003,8 @@ fn main() {
     let ck_maps = &maps[nev..nev + nck];
     let ev_tasks = chunk_tasks(ev_maps, CHUNK);
     let ck_tasks = chunk_tasks(ck_maps, CHUNK);
+    let ev_left = Countdown::new(ev_maps.len(), &ev_tasks);
+    let ck_left = Countdown::new(ck_maps.len(), &ck_tasks);
     let ev_bytes: usize = ev_maps.iter().map(|m| m.bytes().len()).sum();
     let ck_bytes: usize = ck_maps.iter().map(|m| m.bytes().len()).sum();
     let np = 1usize << PBITS;
@@ -1110,6 +1135,7 @@ fn main() {
                     }
                 });
                 st.flush(&links);
+                ev_left.done(t.file, ev_maps);
             } else {
                 let t = &ck_tasks[ti - ev_tasks.len()];
                 let d = ck_maps[t.file].bytes();
@@ -1134,6 +1160,7 @@ fn main() {
                     st.click(&links, CRec { person: uk, cid, ts: (t - ctx.base) as u32, camp });
                 });
                 st.flush(&links);
+                ck_left.done(t.file, ck_maps);
             }
         },
     );
@@ -1354,8 +1381,8 @@ fn main() {
         let cols = vec![
             Column { name: "user_id", logical: Logical::String, values: Values::Str { bytes: ids, ends }, present: None },
             Column { name: "day", logical: Logical::Date, values: Values::I32(rows.iter().map(|r| r.day).collect()), present: None },
-            Column { name: "sessions", logical: Logical::None, values: Values::I64(rows.iter().map(|r| r.sessions as i64).collect()), present: None },
-            Column { name: "events", logical: Logical::None, values: Values::I64(rows.iter().map(|r| r.events as i64).collect()), present: None },
+            Column { name: "sessions", logical: Logical::None, values: Values::I32(rows.iter().map(|r| r.sessions as i32).collect()), present: None },
+            Column { name: "events", logical: Logical::None, values: Values::I32(rows.iter().map(|r| r.events as i32).collect()), present: None },
             Column { name: "revenue_cents", logical: Logical::None, values: Values::I64(rows.iter().map(|r| r.revenue).collect()), present: None },
             Column { name: "top_category", logical: Logical::String, values: Values::Str { bytes: tops, ends: tend }, present: Some(present) },
         ];
