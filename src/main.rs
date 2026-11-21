@@ -215,63 +215,111 @@ impl Countdown {
 }
 
 // ------------------------------------------------------------------ partition buffers
-/// One thread's records, split into `np` partitions, in a single 2 MB-aligned block that asks for
-/// transparent huge pages: partition p fills its own segment of `seg` records, then spills into an
-/// ordinary Vec. Compared with one Vec per partition this takes about 500x fewer page faults (each
-/// costly inside a VM) and far fewer TLB misses in the scatter.
+/// A bump allocator over 2 MB-aligned chunks that ask for transparent huge pages. Memory is
+/// touched only as it is handed out, so a thread's records take about their own size (each new
+/// huge page is zeroed once by the kernel; with 4 KB pages that is 512 faults instead of one).
+struct Arena {
+    chunks: Vec<(*mut u8, std::alloc::Layout)>,
+    next: usize,
+    end: usize,
+}
+
+impl Arena {
+    const CHUNK: usize = 32 << 20;
+    fn new() -> Self {
+        Arena { chunks: Vec::new(), next: 0, end: 0 }
+    }
+    /// `bytes` bytes aligned to 64.
+    #[inline]
+    fn alloc(&mut self, bytes: usize) -> *mut u8 {
+        let bytes = bytes.next_multiple_of(64);
+        if self.next + bytes > self.end {
+            let size = Self::CHUNK.max(bytes.next_multiple_of(2 << 20));
+            let layout = std::alloc::Layout::from_size_align(size, 2 << 20).unwrap();
+            // SAFETY: nonzero size; memory is written before it is read
+            let p = unsafe { std::alloc::alloc(layout) };
+            assert!(!p.is_null(), "out of memory");
+            // SAFETY: fresh, untouched block of `size` bytes
+            huge(unsafe { std::slice::from_raw_parts(p as *const u8, size) });
+            self.chunks.push((p, layout));
+            self.next = p as usize;
+            self.end = p as usize + size;
+        }
+        let p = self.next as *mut u8;
+        self.next += bytes;
+        p
+    }
+    /// Return all pages to the kernel now (on this thread); nothing in the arena is read again.
+    fn release(&self) {
+        for &(p, l) in &self.chunks {
+            release_raw(p, l.size());
+        }
+    }
+}
+
+impl Drop for Arena {
+    fn drop(&mut self) {
+        for &(p, l) in &self.chunks {
+            // SAFETY: allocated in alloc with this layout
+            unsafe { std::alloc::dealloc(p, l) };
+        }
+    }
+}
+
+/// One thread's records split into `np` partitions: each partition is a chain of fixed-size
+/// blocks taken from the thread's arena as it fills.
 struct Parts<T: Copy> {
-    base: *mut T,
-    seg: usize,
-    len: Vec<u32>,
-    spill: Vec<Vec<T>>,
-    layout: std::alloc::Layout,
+    arena: Arena,
+    /// per partition: the block being filled, and how many records it holds
+    cur: Vec<(*mut T, u32)>,
+    /// per partition: full blocks
+    full: Vec<Vec<*mut T>>,
+    block: u32,
 }
 unsafe impl<T: Copy + Send> Send for Parts<T> {}
 unsafe impl<T: Copy + Sync> Sync for Parts<T> {}
 
 impl<T: Copy> Parts<T> {
-    fn new(np: usize, seg: usize) -> Self {
-        let seg = seg.max(1);
-        let bytes = (np * seg * std::mem::size_of::<T>()).next_multiple_of(2 << 20);
-        let layout = std::alloc::Layout::from_size_align(bytes, 2 << 20).unwrap();
-        // SAFETY: nonzero size; the memory is only read where it was written (below `len`).
-        let base = unsafe { std::alloc::alloc(layout) } as *mut T;
-        assert!(!base.is_null(), "out of memory");
-        // SAFETY: the block is fresh and untouched
-        huge(unsafe { std::slice::from_raw_parts(base as *const u8, bytes) });
-        Parts { base, seg, len: vec![0; np], spill: (0..np).map(|_| Vec::new()).collect(), layout }
+    fn new(np: usize, block: usize) -> Self {
+        Parts { arena: Arena::new(), cur: vec![(std::ptr::null_mut(), block as u32); np], full: vec![Vec::new(); np], block: block as u32 }
     }
     #[inline(always)]
     fn push(&mut self, p: usize, x: T) {
-        let l = self.len[p] as usize;
-        if l < self.seg {
-            // SAFETY: p < np and l < seg, inside the block
-            unsafe { self.base.add(p * self.seg + l).write(x) };
-            self.len[p] = l as u32 + 1;
+        let (b, n) = self.cur[p];
+        if n < self.block {
+            // SAFETY: b holds `block` records and n < block
+            unsafe { b.add(n as usize).write(x) };
+            self.cur[p].1 = n + 1;
         } else {
-            self.spill[p].push(x);
+            self.grow(p, x);
         }
     }
-    /// The records of partition p: its segment, then its spill.
-    fn part(&self, p: usize) -> [&[T]; 2] {
-        // SAFETY: the first len[p] records of the segment were written by push
-        let main = unsafe { std::slice::from_raw_parts(self.base.add(p * self.seg), self.len[p] as usize) };
-        [main, &self.spill[p][..]]
+    #[cold]
+    #[inline(never)]
+    fn grow(&mut self, p: usize, x: T) {
+        let (b, _) = self.cur[p];
+        if !b.is_null() {
+            self.full[p].push(b);
+        }
+        let nb = self.arena.alloc(self.block as usize * std::mem::size_of::<T>()) as *mut T;
+        // SAFETY: a fresh block of `block` records
+        unsafe { nb.write(x) };
+        self.cur[p] = (nb, 1);
+    }
+    /// The records of partition p, one slice per block.
+    fn part(&self, p: usize) -> impl Iterator<Item = &[T]> + '_ {
+        let k = self.block as usize;
+        let (b, n) = self.cur[p];
+        // SAFETY: full blocks hold `block` records, the current one `n`
+        let last = if b.is_null() { &[][..] } else { unsafe { std::slice::from_raw_parts(b as *const T, n as usize) } };
+        self.full[p].iter().map(move |&f| unsafe { std::slice::from_raw_parts(f as *const T, k) }).chain(std::iter::once(last))
     }
     fn count(&self, p: usize) -> usize {
-        self.len[p] as usize + self.spill[p].len()
+        let (b, n) = self.cur[p];
+        self.full[p].len() * self.block as usize + if b.is_null() { 0 } else { n as usize }
     }
-    /// Return the block's pages to the kernel now (on this thread); the records must not be read again.
     fn release(&self) {
-        // SAFETY: the block is valid for layout.size() bytes
-        release_raw(self.base as *const u8, self.layout.size());
-    }
-}
-
-impl<T: Copy> Drop for Parts<T> {
-    fn drop(&mut self) {
-        // SAFETY: allocated in new with this layout
-        unsafe { std::alloc::dealloc(self.base as *mut u8, self.layout) };
+        self.arena.release();
     }
 }
 
@@ -1192,13 +1240,8 @@ fn main() {
     let ck_tasks = chunk_tasks(ck_maps, CHUNK);
     let ev_left = Countdown::new(ev_maps.len(), &ev_tasks);
     let ck_left = Countdown::new(ck_maps.len(), &ck_tasks);
-    let ev_bytes: usize = ev_maps.iter().map(|m| m.bytes().len()).sum();
-    let ck_bytes: usize = ck_maps.iter().map(|m| m.bytes().len()).sum();
     let np = 1usize << PBITS;
     let nq = 1usize << QBITS;
-    // segment sizes: the expected records per thread and partition, with headroom (more spill)
-    let ev_reserve = ev_bytes / 70 / nthreads / np * 13 / 10 + 32;
-    let ck_reserve = ck_bytes / 40 / nthreads / nq * 3 / 2 + 32;
     #[derive(Clone, Copy)]
     enum Job {
         Union(usize),
@@ -1273,8 +1316,8 @@ fn main() {
         nthreads,
         jobs.len(),
         |_| BState {
-            ep: Parts::new(np, ev_reserve),
-            cp: Parts::new(nq, ck_reserve),
+            ep: Parts::new(np, 512),
+            cp: Parts::new(nq, 512),
             cring: [(C0, 0); RING],
             cn: 0,
         },
@@ -1435,21 +1478,21 @@ fn main() {
         idx: Vec<u32>,
         touched: Vec<u32>,
     }
-    let pp_reserve = ev_bytes / 75 / nthreads / nq * 13 / 10 + 32;
-    // record ids: slice (segment or spill of each parse thread) and index within it
-    let sbits = (usize::BITS - (2 * nthreads - 1).leading_zeros()).max(1);
-    let rbits = 32 - sbits;
+
     let cstates = par(
         nthreads,
         np,
         |_| CState {
-            pp: Parts::new(nq, pp_reserve),
+            pp: Parts::new(nq, 1024),
             keys: Vec::new(),
             idx: Vec::new(),
             touched: Vec::new(),
         },
         |st, p| {
             let slices: Vec<&[ERec]> = bstates.iter().flat_map(|s| s.ep.part(p)).collect();
+            // record ids: block (slice) number and index within it
+            let sbits = (usize::BITS - slices.len().max(2).saturating_sub(1).leading_zeros()).max(1);
+            let rbits = 32 - sbits;
             let n: usize = slices.iter().map(|s| s.len()).sum();
             let tbits = (n + n / 2).next_power_of_two().max(64).trailing_zeros();
             let cap = 1usize << tbits;
