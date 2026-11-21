@@ -853,38 +853,43 @@ fn main() {
     let day0 = ws.div_euclid(DAY);
     let ndays = ((we - 1).div_euclid(DAY) - day0 + 1) as usize;
 
-    let prod_pairs = read_pairs(&data.join("products.csv"));
-    let mut cats: Vec<Vec<u8>> = prod_pairs.iter().map(|(_, c)| c.clone()).collect();
-    cats.push(b"unknown".to_vec());
-    cats.sort();
-    cats.dedup();
-    assert!(cats.len() < NO_CAT as usize, "too many categories");
-    let unknown = cats.iter().position(|c| c == b"unknown").unwrap() as u8;
-    let cat_index: HashMap<&[u8], u8> = cats.iter().enumerate().map(|(i, c)| (&c[..], i as u8)).collect();
-    let prod: Vec<(Vec<u8>, u8)> = prod_pairs.iter().map(|(p, c)| (p.clone(), cat_index[&c[..]])).collect();
-    let products = IdMap::build(&prod, b"p", unknown);
-
-    let camp_pairs = read_pairs(&data.join("campaigns.csv"));
-    let camp_ids: Vec<Vec<u8>> = camp_pairs.iter().map(|(c, _)| c.clone()).collect();
-    let camp_chan: Vec<Vec<u8>> = camp_pairs.iter().map(|(_, ch)| ch.clone()).collect();
-    let camp: Vec<(Vec<u8>, u32)> = camp_ids.iter().enumerate().map(|(i, c)| (c.clone(), i as u32)).collect();
-    let campaigns = IdMap::build(&camp, b"c_", u32::MAX);
-    let interval_clicks = std::env::var("SS_INTERVAL_CLICKS").ok().and_then(|v| v.parse().ok()).unwrap_or(256);
-    let ctx = Ctx { ws, we, base, day0, ndays, cats, products, campaigns, camp_ids, camp_chan, interval_clicks };
-
-    let ev_files = csv_files(&data.join("events"));
-    let ck_files = csv_files(&data.join("clicks"));
-    let ln_files = csv_files(&data.join("links"));
-    let nev = ev_files.len();
-    let nck = ck_files.len();
-    let all_files: Vec<PathBuf> = ev_files.iter().chain(&ck_files).chain(&ln_files).cloned().collect();
-    let maps: Vec<Map> = {
+    let load_lookups = || {
+        let prod_pairs = read_pairs(&data.join("products.csv"));
+        let mut cats: Vec<Vec<u8>> = prod_pairs.iter().map(|(_, c)| c.clone()).collect();
+        cats.push(b"unknown".to_vec());
+        cats.sort();
+        cats.dedup();
+        assert!(cats.len() < NO_CAT as usize, "too many categories");
+        let unknown = cats.iter().position(|c| c == b"unknown").unwrap() as u8;
+        let cat_index: HashMap<&[u8], u8> = cats.iter().enumerate().map(|(i, c)| (&c[..], i as u8)).collect();
+        let prod: Vec<(Vec<u8>, u8)> = prod_pairs.iter().map(|(p, c)| (p.clone(), cat_index[&c[..]])).collect();
+        let products = IdMap::build(&prod, b"p", unknown);
+        let camp_pairs = read_pairs(&data.join("campaigns.csv"));
+        let camp_ids: Vec<Vec<u8>> = camp_pairs.iter().map(|(c, _)| c.clone()).collect();
+        let camp_chan: Vec<Vec<u8>> = camp_pairs.iter().map(|(_, ch)| ch.clone()).collect();
+        let camp: Vec<(Vec<u8>, u32)> = camp_ids.iter().enumerate().map(|(i, c)| (c.clone(), i as u32)).collect();
+        let campaigns = IdMap::build(&camp, b"c_", u32::MAX);
+        let interval_clicks = std::env::var("SS_INTERVAL_CLICKS").ok().and_then(|v| v.parse().ok()).unwrap_or(256);
+        Ctx { ws, we, base, day0, ndays, cats, products, campaigns, camp_ids, camp_chan, interval_clicks }
+    };
+    let map_inputs = || {
+        let ev_files = csv_files(&data.join("events"));
+        let ck_files = csv_files(&data.join("clicks"));
+        let ln_files = csv_files(&data.join("links"));
+        let (nev, nck) = (ev_files.len(), ck_files.len());
+        let all_files: Vec<PathBuf> = ev_files.iter().chain(&ck_files).chain(&ln_files).cloned().collect();
         let slots: Vec<std::sync::Mutex<Option<Map>>> = all_files.iter().map(|_| std::sync::Mutex::new(None)).collect();
         par(nthreads, all_files.len(), |_| (), |_, i| {
             *slots[i].lock().unwrap() = Some(Map::open(&all_files[i]));
         });
-        slots.into_iter().map(|m| m.into_inner().unwrap().unwrap()).collect()
+        let maps: Vec<Map> = slots.into_iter().map(|m| m.into_inner().unwrap().unwrap()).collect();
+        (maps, nev, nck)
     };
+    let (ctx, (maps, nev, nck)) = std::thread::scope(|sc| {
+        let h = sc.spawn(load_lookups);
+        let m = map_inputs();
+        (h.join().unwrap(), m)
+    });
     lap("open");
 
     // ---- A: links
