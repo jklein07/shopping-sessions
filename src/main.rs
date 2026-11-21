@@ -1099,43 +1099,17 @@ fn main() {
     });
     lap("open");
 
-    // ---- A: links
+    // ---- A+B: links, events and clicks in one task queue. Event lines do not need the links
+    // (their persons are resolved in dedup), so the link union and naming steps run between
+    // event chunks instead of behind barriers; click lines need the names and come last.
     let link_maps = &maps[nev + nck..];
     let link_bytes: usize = link_maps.iter().map(|m| m.bytes().len()).sum();
     let links = LinkTable::new(link_bytes / 20 * 2 * 13 / 10 + 1024);
     let link_tasks = chunk_tasks(link_maps, (link_bytes / (nthreads * 16)).clamp(64 << 10, CHUNK));
     let link_left = Countdown::new(link_maps.len(), &link_tasks);
-    par(nthreads, link_tasks.len(), |_| (), |_, ti| {
-        let t = &link_tasks[ti];
-        let d = link_maps[t.file].bytes();
-        csv::scan::<2>(d, t.start, t.end, |buf, f, ok| {
-            if ok && f[0].0 < f[0].1 && f[1].0 < f[1].1 {
-                let a = keys::key(&buf[f[0].0..f[0].1]);
-                let b = keys::key(&buf[f[1].0..f[1].1]);
-                if a != b {
-                    let sa = links.insert(a);
-                    let sb = links.insert(b);
-                    links.union(sa, sb);
-                }
-            }
-        });
-        link_left.done(t.file, link_maps);
-    });
-    lap("links: union");
     let cap = links.mask + 1;
     let blocks = 256.min(cap);
     let per = cap / blocks;
-    // roots, fully compressed
-    par(nthreads, blocks, |_| (), |_, b| {
-        for i in b * per..(b + 1) * per {
-            if links.slots[2 * i].load(Relaxed) != 0 {
-                let r = links.find(i as u32);
-                if r != i as u32 {
-                    links.parent[i].store(r + 1, Relaxed);
-                }
-            }
-        }
-    });
     let root = |i: usize| -> usize {
         let p = links.parent[i].load(Relaxed);
         if p == 0 {
@@ -1144,41 +1118,8 @@ fn main() {
             (p - 1) as usize
         }
     };
-    if keys::ANY_WEIRD.load(Relaxed) {
-        for i in 0..cap {
-            let k = links.slots[2 * i].load(Relaxed);
-            if k != 0 {
-                let r = root(i);
-                let cur = links.slots[2 * r + 1].load(Relaxed);
-                if cur == 0 || keys::cmp_keys(k, !cur) == std::cmp::Ordering::Less {
-                    links.slots[2 * r + 1].store(!k, Relaxed);
-                }
-            }
-        }
-    } else {
-        par(nthreads, blocks, |_| (), |_, b| {
-            for i in b * per..(b + 1) * per {
-                let k = links.slots[2 * i].load(Relaxed);
-                if k != 0 {
-                    links.slots[2 * root(i) + 1].fetch_max(!k, Relaxed);
-                }
-            }
-        });
-    }
-    par(nthreads, blocks, |_| (), |_, b| {
-        for i in b * per..(b + 1) * per {
-            if links.slots[2 * i].load(Relaxed) != 0 {
-                let r = root(i);
-                if r != i {
-                    let name = links.slots[2 * r + 1].load(Relaxed);
-                    links.slots[2 * i + 1].store(name, Relaxed);
-                }
-            }
-        }
-    });
-    lap("links: named");
-
-    // ---- B: parse events and clicks
+    // whether any link ID is weird, fixed by the first naming task (all link IDs are in by then)
+    let weird_names = std::sync::OnceLock::<bool>::new();
     let ev_maps = &maps[..nev];
     let ck_maps = &maps[nev..nev + nck];
     let ev_tasks = chunk_tasks(ev_maps, CHUNK);
@@ -1191,29 +1132,49 @@ fn main() {
     let nq = 1usize << QBITS;
     let ev_reserve = ev_bytes / 70 / nthreads / np + 64;
     let ck_reserve = ck_bytes / 40 / nthreads / nq + 64;
+    #[derive(Clone, Copy)]
+    enum Job {
+        Union(usize),
+        Compress(usize),
+        Name(usize),
+        Propagate(usize),
+        Event(usize),
+        Click(usize),
+    }
+    // Every job waits only on jobs earlier in the queue, so the queue cannot deadlock.
+    let mut jobs: Vec<Job> = (0..link_tasks.len()).map(Job::Union).collect();
+    let mut next_ev = 0..ev_tasks.len();
+    let mut some_events = |jobs: &mut Vec<Job>, k: usize| jobs.extend(next_ev.by_ref().take(k).map(Job::Event));
+    some_events(&mut jobs, nthreads);
+    jobs.extend((0..blocks).map(Job::Compress));
+    some_events(&mut jobs, nthreads);
+    jobs.extend((0..blocks).map(Job::Name));
+    some_events(&mut jobs, nthreads);
+    jobs.extend((0..blocks).map(Job::Propagate));
+    some_events(&mut jobs, usize::MAX);
+    jobs.extend((0..ck_tasks.len()).map(Job::Click));
+    let done_union = AtomicUsize::new(0);
+    let done_compress = AtomicUsize::new(0);
+    let done_name = AtomicUsize::new(0);
+    let done_propagate = AtomicUsize::new(0);
+    let wait = |c: &AtomicUsize, target: usize| {
+        let mut spins = 0u32;
+        while c.load(Acquire) < target {
+            spins += 1;
+            if spins < 64 {
+                std::hint::spin_loop();
+            } else {
+                std::thread::yield_now();
+            }
+        }
+    };
     struct BState {
         ep: Vec<Vec<ERec>>,
         cp: Vec<Vec<CRec>>,
-        ering: [(ERec, usize); RING],
-        en: usize,
         cring: [(CRec, usize); RING],
         cn: usize,
     }
     impl BState {
-        /// Queue an event whose `person` holds the user's ID key; resolve the oldest.
-        #[inline(always)]
-        fn event(&mut self, links: &LinkTable, r: ERec) {
-            let slot = links.home(r.person);
-            links.prefetch(slot);
-            let i = self.en % RING;
-            if self.en >= RING {
-                let (mut old, oslot) = self.ering[i];
-                old.person = links.person_at(oslot, old.person);
-                self.ep[(keys::hash(old.eid) >> (64 - PBITS)) as usize].push(old);
-            }
-            self.ering[i] = (r, slot);
-            self.en += 1;
-        }
         #[inline(always)]
         fn click(&mut self, links: &LinkTable, r: CRec) {
             let slot = links.home(r.person);
@@ -1232,13 +1193,6 @@ fn main() {
             self.cp[(keys::hash2(c.person) >> (64 - QBITS)) as usize].push(c);
         }
         fn flush(&mut self, links: &LinkTable) {
-            let n = self.en.min(RING);
-            for k in 0..n {
-                let (mut old, oslot) = self.ering[(self.en - n + k) % RING];
-                old.person = links.person_at(oslot, old.person);
-                self.ep[(keys::hash(old.eid) >> (64 - PBITS)) as usize].push(old);
-            }
-            self.en = 0;
             let n = self.cn.min(RING);
             for k in 0..n {
                 let (old, oslot) = self.cring[(self.cn - n + k) % RING];
@@ -1247,22 +1201,87 @@ fn main() {
             self.cn = 0;
         }
     }
-    const E0: ERec = ERec { eid: 0, person: 0, ingest: 0, ts: 0, pc: 0 };
     const C0: CRec = CRec { person: 0, cid: 0, ts: 0, camp: 0 };
-    let ntasks = ev_tasks.len() + ck_tasks.len();
     let bstates = par(
         nthreads,
-        ntasks,
+        jobs.len(),
         |_| BState {
             ep: (0..np).map(|_| Vec::with_capacity(ev_reserve)).collect(),
             cp: (0..nq).map(|_| Vec::with_capacity(ck_reserve)).collect(),
-            ering: [(E0, 0); RING],
-            en: 0,
             cring: [(C0, 0); RING],
             cn: 0,
         },
-        |st, ti| {
-            if ti < ev_tasks.len() {
+        |st, ji| match jobs[ji] {
+            Job::Union(ti) => {
+                let t = &link_tasks[ti];
+                let d = link_maps[t.file].bytes();
+                csv::scan::<2>(d, t.start, t.end, |buf, f, ok| {
+                    if ok && f[0].0 < f[0].1 && f[1].0 < f[1].1 {
+                        let a = keys::key(&buf[f[0].0..f[0].1]);
+                        let b = keys::key(&buf[f[1].0..f[1].1]);
+                        if a != b {
+                            let sa = links.insert(a);
+                            let sb = links.insert(b);
+                            links.union(sa, sb);
+                        }
+                    }
+                });
+                link_left.done(t.file, link_maps);
+                done_union.fetch_add(1, Release);
+            }
+            Job::Compress(b) => {
+                // roots, fully compressed
+                wait(&done_union, link_tasks.len());
+                for i in b * per..(b + 1) * per {
+                    if links.slots[2 * i].load(Relaxed) != 0 {
+                        let r = links.find(i as u32);
+                        if r != i as u32 {
+                            links.parent[i].store(r + 1, Relaxed);
+                        }
+                    }
+                }
+                done_compress.fetch_add(1, Release);
+            }
+            Job::Name(b) => {
+                // each root's name: its smallest ID (stored as !key so fetch_max finds it)
+                wait(&done_compress, blocks);
+                if *weird_names.get_or_init(|| keys::ANY_WEIRD.load(Acquire)) {
+                    if b == 0 {
+                        for i in 0..cap {
+                            let k = links.slots[2 * i].load(Relaxed);
+                            if k != 0 {
+                                let r = root(i);
+                                let cur = links.slots[2 * r + 1].load(Relaxed);
+                                if cur == 0 || keys::cmp_keys(k, !cur) == std::cmp::Ordering::Less {
+                                    links.slots[2 * r + 1].store(!k, Relaxed);
+                                }
+                            }
+                        }
+                    }
+                } else {
+                    for i in b * per..(b + 1) * per {
+                        let k = links.slots[2 * i].load(Relaxed);
+                        if k != 0 {
+                            links.slots[2 * root(i) + 1].fetch_max(!k, Relaxed);
+                        }
+                    }
+                }
+                done_name.fetch_add(1, Release);
+            }
+            Job::Propagate(b) => {
+                wait(&done_name, blocks);
+                for i in b * per..(b + 1) * per {
+                    if links.slots[2 * i].load(Relaxed) != 0 {
+                        let r = root(i);
+                        if r != i {
+                            let name = links.slots[2 * r + 1].load(Relaxed);
+                            links.slots[2 * i + 1].store(name, Relaxed);
+                        }
+                    }
+                }
+                done_propagate.fetch_add(1, Release);
+            }
+            Job::Event(ti) => {
                 let t = &ev_tasks[ti];
                 let d = ev_maps[t.file].bytes();
                 csv::scan::<7>(d, t.start, t.end, |buf, f, ok| {
@@ -1306,17 +1325,14 @@ fn main() {
                         pc = (price << 8) | cat as u32;
                         uk = keys::key(uid);
                     }
-                    let r = ERec { eid: ek, person: uk, ingest, ts: tsv, pc };
-                    if tsv != INVALID {
-                        st.event(&links, r);
-                    } else {
-                        st.ep[(keys::hash(ek) >> (64 - PBITS)) as usize].push(r);
-                    }
+                    // person holds the user's ID key here; dedup resolves it
+                    st.ep[(keys::hash(ek) >> (64 - PBITS)) as usize].push(ERec { eid: ek, person: uk, ingest, ts: tsv, pc });
                 });
-                st.flush(&links);
                 ev_left.done(t.file, ev_maps);
-            } else {
-                let t = &ck_tasks[ti - ev_tasks.len()];
+            }
+            Job::Click(ti) => {
+                wait(&done_propagate, blocks);
+                let t = &ck_tasks[ti];
                 let d = ck_maps[t.file].bytes();
                 csv::scan::<4>(d, t.start, t.end, |buf, f, ok| {
                     if !ok || f[0].0 == f[0].1 || f[1].0 == f[1].1 {
@@ -1343,7 +1359,7 @@ fn main() {
             }
         },
     );
-    lap("parse");
+    lap("links + parse");
 
     // ---- C: dedup per event_id partition, repartition by person
     struct CState {
@@ -1399,14 +1415,31 @@ fn main() {
                     }
                 }
             }
+            // kept valid events: resolve the user to its person through the link table, with the
+            // lookups prefetched RING records ahead
+            let mut ring = [(0u64, 0u32, 0u32, 0usize); RING];
+            let mut n = 0usize;
+            let emit = |pp: &mut Vec<Vec<PRec>>, (user, ts, pc, slot): (u64, u32, u32, usize)| {
+                let person = links.person_at(slot, user);
+                pp[(keys::hash2(person) >> (64 - QBITS)) as usize].push(PRec { person, ts, pc });
+            };
             for &i in &st.touched {
                 let i = i as usize;
                 st.keys[i] = 0;
                 let r = rec(st.idx[i]);
                 if r.ts != INVALID {
-                    let q = (keys::hash2(r.person) >> (64 - QBITS)) as usize;
-                    st.pp[q].push(PRec { person: r.person, ts: r.ts, pc: r.pc });
+                    let slot = links.home(r.person);
+                    links.prefetch(slot);
+                    let k = n % RING;
+                    if n >= RING {
+                        emit(&mut st.pp, ring[k]);
+                    }
+                    ring[k] = (r.person, r.ts, r.pc, slot);
+                    n += 1;
                 }
+            }
+            for k in n.saturating_sub(RING)..n {
+                emit(&mut st.pp, ring[k % RING]);
             }
             st.touched.clear();
             for s in &bstates {
