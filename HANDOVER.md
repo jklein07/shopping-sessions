@@ -54,54 +54,56 @@ On an i9-13900HX the logical CPUs 0–15 are usually the 8 P-cores × 2 threads.
 VM vCPUs, and Windows decides which physical cores back them, so keep the laptop on AC power with the
 best-performance power mode. Compare versions A/B, alternating several runs; absolute times will not match the scorer.
 
-## Where things stand (2026-11-20, 9:10 PM ET)
+## Where things stand (2026-11-20, 10:00 PM ET)
 
 | Commit | Change | Board (≈20M events) |
 | --- | --- | --- |
 | b2ff277 | first correct version | 1.86 s |
 | ea40960 | SIMD CSV scan, SWAR timestamps, 7-bit ID keys | 1.66 s |
-| b0904ad … e45477e | prefetched link lookups, 128-byte splitter, table dates, early unmap | not submitted |
-| a592edd | + pages released in parallel before exit, no memcmp, SWAR product IDs, mask-based quoted-line split | 1.44 s |
-| b0fb546, d4ce5ee | faster Parquet writing; links read ahead first | not submitted |
-| b0d2093 | + SIMD date-time parse (NEON / SSSE3) | submitted 9:08 PM |
+| a592edd | prefetched link lookups, mask-based CSV split, parallel page release | 1.44 s |
+| b0d2093 | + SIMD date-time parse (NEON / SSSE3) | 1.42 s |
+| f443325 | + faster Parquet, links overlapped with event parsing, user_daily written per thread | 1.25 s |
+| 4582c93 | + partition buffers in huge-page segments | not submitted |
+| e827b33 | + partition buffers as block chains from a per-thread huge-page arena | submit 10:08 PM |
 
-The leader was at 1.17 s at 8:10 PM.
+The leader was BobBuildIt at 0.99 s (9 PM).
 
-**What the board numbers say.** M4 cycle counts for the whole 20M run (`/usr/bin/time -l`, same conditions):
-b2ff277 ≈ 21 G, ea40960 ≈ 17 G, a592edd ≈ 10.9 G. Board times fall much less than the cycles do, so a large part
-of each board time does not depend on our work: a straight-line fit gives about 0.9–1.05 s fixed (container start,
-reading the data, exit) plus about 0.04 s per G cycles. Compute is now roughly 0.45 s of the 1.44 s. Machines vary by up
-to 20%, so treat this as a rough guide. At 60M events in the final the compute share is about three times larger, so
-CPU work still matters most there.
+**Timing on x86 (the Legion).** The user's laptop (i9-13900HX, Windows 11, Docker Desktop on WSL2) is reachable as
+`ssh legion` (Windows cmd). CPUs 0–7 in its VM are 4 cores × 2 hyperthreads, the scorer's layout, and transparent huge
+pages are in `madvise` mode. Run with `--cpuset-cpus 0-7 --memory 12g`. Times there track the board closely
+(a592edd ≈1.35 s, board 1.44; b0d2093 ≈1.34 s, board 1.42), so **the board time is almost all our own compute**; the
+fixed part is small. The laptop is also the user's machine: timings are noisy, keep jobs short, and A/B by alternating
+builds over several rounds.
 
-Measuring on the shared Mac: wall time is useless while other sessions run (load 50–140). Compare builds with
-`/usr/bin/time -l` (instructions retired and cycles elapsed) and with `ss bench FILE` (single thread, per line). Per
-event line on one M4 core (b0d2093): split 10 ns, both timestamps 10.5 ns, handler total about 32 ns. In the full run,
-link-table lookups add about 10 ns per line (DRAM).
+Docker on the Legion cannot pull images over SSH (the Windows credential helper needs an interactive logon). Workaround
+in use: cross-compile static x86-64 binaries on the Mac in the `sscross` image (rust:1.91-slim-bookworm +
+gcc-x86-64-linux-gnu; symlink `/usr/x86_64-linux-gnu/lib/*.a` into `/usr/lib/x86_64-linux-gnu/` before linking),
+`scp` them to `C:\Users\skyra\ssbench\bin`, and run them in the existing `br-dev` image with the data in the docker
+volume `ssdata` (`/d/dev`, `/d/d20`, `/d/d60`, made with the cross-compiled generator). An `ssperf` image (br-dev +
+linux-perf + binutils, made with `docker commit`) gives line-level `perf` profiles; write perf.data to `/tmp` inside
+the container, not to a Windows bind mount.
 
-Linux profiling: the `ssperf` image (rust:1.91-slim-bookworm + linux-perf) runs `perf record` in the Colima VM with
-`--cap-add PERFMON --cap-add SYS_ADMIN --security-opt seccomp=unconfined`. The 20M data set is in the docker volume
-`ssd20` (VM-local disk; host bind mounts are slow). Scratch builds go in the `ssprof` volume.
+**What x86 showed.** With one Vec per partition, about 20% of all CPU was the kernel zeroing and faulting 4 KB pages
+for ~1 GB of partition records (expensive in a VM). Partition buffers now come from per-thread huge-page arenas in
+fixed-size blocks (`Parts`/`Arena`), touched only as filled: kernel share 15% → 5%, and 20M runs 1.07–1.41 s → 0.81–1.02 s
+on the Legion. At 60M: 2.9–3.5 s, peak cgroup memory ≈5.1 GB. Tried and dropped there: 512 or 2048 event partitions
+(PBITS 9/11; noise or worse).
+
+Measuring on the Mac: use `/usr/bin/time -l` (instructions, cycles) and `ss bench FILE`; wall time is noisy. The M4 is
+about 2× faster per thread than the scorer, and its memory system hides the page-fault and TLB costs that dominate x86.
 
 Correctness gates (run all before every submission): `cargo test --release` (2M random timestamps against a slow
 parser, 3M SIMD vs SWAR prefixes, 3.9M random CSV lines fast vs scalar splitter, 1M ID round trips, 2M dense-ID
-lookups), the 36 fixtures, dev-answer, and 14 cross-check datasets (seeds 2–13, 15, 21, 272, from 1k to 3M events, two
-of them spanning Feb 29 2028) against `reference/reference.py`. Also run with `SS_INTERVAL_CLICKS=0`, the x86 build
-(`x86_64-apple-darwin`, x86-64-v3, under Rosetta), and the Linux arm64 build in a container
-(`shopping-sessions-work/linux_check.sh`). `cargo check --target x86_64-unknown-linux-gnu` in a container catches
-compile errors on the scorer's target.
-
-Tried and dropped: MAP_POPULATE on the inputs (more time in open than saved in parse), glibc
-`glibc.malloc.hugetlb=1` (thread arenas get no huge pages), a branch-free scalar timestamp parser (no faster on M4), a
-fingerprinted dedup table (no faster).
+lookups), the 36 fixtures, dev-answer, and 14 cross-check datasets against `reference/reference.py`
+(`shopping-sessions-work/check_all.sh BINARY`), also with `SS_INTERVAL_CLICKS=0`, `NCPU=1` and `NCPU=3`; the x86 build
+under Rosetta; the Linux arm64 build in a container (`linux_check.sh`); and the cross-compiled x86 binary on the
+Legion's dev set compared with the dev answer.
 
 ## Next ideas, roughly by expected gain
 
-1. Parse is about 55% of CPU. Per line: split 10 ns, timestamps 10.5 ns (F3 epoch values still SWAR), link lookup about
-   10 ns of DRAM latency in the full run. Ideas: SIMD F3; a bitmap filter so unlinked users (about 38% of events) skip the
-   link table; a compacted link table after naming.
-2. Sessions (0.55 s CPU): per-person sorting is about a third. Idea: one counting pass by coarse time before the
-   person scatter, so the per-person insertion sorts see nearly sorted input.
-3. Huge pages: our own per-thread arenas with MADV_HUGEPAGE for the partition buffers (fewer faults, fewer TLB misses in
-   the 1024-way scatter). Only helps if the scorer has THP enabled.
-4. Dedup (0.36 s CPU): prefetch the hash probes.
+1. Timestamps are now the largest single function on x86 (about 11% of samples); F3 epoch values are still SWAR.
+2. The partition scatter (about 10% on x86): 1024 write streams per thread. Ideas: software write-combining buffers
+   (one cache line per partition, flushed with full-line stores).
+3. Dedup at 60M grows faster than the data (tables outgrow L2): prefetch the probes, or a two-level partition only
+   for dedup.
+4. Sessions: per-person sorting is about a third of the phase.
