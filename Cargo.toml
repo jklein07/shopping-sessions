@@ -1,0 +1,20 @@
+[package]
+name = "shopping-sessions"
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+description = "Fast Shopping Sessions pipeline: messy click-stream CSV to two daily Parquet tables"
+publish = false
+
+[[bin]]
+name = "ss"
+path = "src/main.rs"
+
+[dependencies]
+
+[profile.release]
+opt-level = 3
+lto = "fat"
+codegen-units = 1
+panic = "abort"
+debug = false
