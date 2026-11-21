@@ -1502,9 +1502,16 @@ fn main() {
             }
             let mask = cap - 1;
             let rec = |g: u32| -> &ERec { &slices[(g >> rbits) as usize][(g & ((1 << rbits) - 1)) as usize] };
+            const AHEAD: usize = 8;
             for (si, s) in slices.iter().enumerate() {
                 assert!(s.len() < (1usize << rbits), "partition too large");
                 for (ri, r) in s.iter().enumerate() {
+                    // prefetch the table slot of the record AHEAD positions later in this block
+                    if let Some(f) = s.get(ri + AHEAD) {
+                        let fi = ((keys::hash(f.eid) << PBITS) >> (64 - tbits)) as usize;
+                        prefetch(st.keys.as_ptr().wrapping_add(fi) as *const u8);
+                        prefetch(st.idx.as_ptr().wrapping_add(fi) as *const u8);
+                    }
                     let g = ((si as u32) << rbits) | ri as u32;
                     let h = keys::hash(r.eid);
                     let mut i = ((h << PBITS) >> (64 - tbits)) as usize;
