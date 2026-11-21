@@ -229,8 +229,14 @@ enum IdMap<V: Copy> {
 
 fn dense_num(s: &[u8], prefix: &[u8]) -> Option<usize> {
     let n = prefix.len();
-    if s.len() <= n || s.len() > n + 7 || &s[..n] != prefix || s[n] == b'0' {
+    if s.len() <= n || s.len() > n + 7 || s[n] == b'0' {
         return None;
+    }
+    for i in 0..n {
+        // a byte loop: a slice comparison here compiles to a memcmp call
+        if s[i] != prefix[i] {
+            return None;
+        }
     }
     let mut v = 0usize;
     for &c in &s[n..] {
@@ -417,6 +423,23 @@ impl LinkTable {
 }
 
 // ------------------------------------------------------------------ small parsers
+/// `view`/`cart` -> Some(false), `purchase` -> Some(true), anything else None (no memcmp calls).
+#[inline(always)]
+fn event_kind(ty: &[u8]) -> Option<bool> {
+    match ty.len() {
+        4 => {
+            let w = u32::from_le_bytes(ty.try_into().unwrap());
+            if w == u32::from_le_bytes(*b"view") || w == u32::from_le_bytes(*b"cart") {
+                Some(false)
+            } else {
+                None
+            }
+        }
+        8 if u64::from_le_bytes(ty.try_into().unwrap()) == u64::from_le_bytes(*b"purchase") => Some(true),
+        _ => None,
+    }
+}
+
 #[inline(always)]
 fn parse_price(s: &[u8]) -> Option<u32> {
     if s.is_empty() {
@@ -858,11 +881,10 @@ fn bench(path: &str) {
                         break 'v;
                     }
                     let ty = fld(4);
-                    let purchase = match ty.len() {
-                        4 if ty == b"view" || ty == b"cart" => false,
-                        8 if ty == b"purchase" => true,
-                        _ => break 'v,
-                    };
+                    let purchase = match event_kind(ty) {
+                            Some(p) => p,
+                            None => break 'v,
+                        };
                     let t = if level == 3 { ws + 1000 } else { match ts::parse(fld(2)) { Some(t) => t, None => break 'v } };
                     if t < ws || t >= we || ingest.saturating_sub(t) > LATE {
                         break 'v;
@@ -1145,10 +1167,9 @@ fn main() {
                             break 'v;
                         }
                         let ty = fld(4);
-                        let purchase = match ty.len() {
-                            4 if ty == b"view" || ty == b"cart" => false,
-                            8 if ty == b"purchase" => true,
-                            _ => break 'v,
+                        let purchase = match event_kind(ty) {
+                            Some(p) => p,
+                            None => break 'v,
                         };
                         let t = match ts::parse(fld(2)) {
                             Some(t) => t,
