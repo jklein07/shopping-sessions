@@ -238,6 +238,68 @@ fn par<S: Send>(
     })
 }
 
+/// `par`, then `fin(state, thread)` on each thread as soon as it finds no task left (so a
+/// thread's own follow-up work overlaps the other threads' last tasks).
+fn par_then<S: Send>(
+    nthreads: usize,
+    ntasks: usize,
+    init: impl Fn(usize) -> S + Sync,
+    work: impl Fn(&mut S, usize) + Sync,
+    fin: impl Fn(&mut S, usize) + Sync,
+) -> Vec<S> {
+    let next = AtomicUsize::new(0);
+    std::thread::scope(|sc| {
+        let hs: Vec<_> = (0..nthreads)
+            .map(|t| {
+                let (next, init, work, fin) = (&next, &init, &work, &fin);
+                sc.spawn(move || {
+                    let mut s = init(t);
+                    loop {
+                        let i = next.fetch_add(1, Relaxed);
+                        if i >= ntasks {
+                            break;
+                        }
+                        work(&mut s, i);
+                    }
+                    fin(&mut s, t);
+                    s
+                })
+            })
+            .collect();
+        hs.into_iter().map(|h| h.join().unwrap()).collect()
+    })
+}
+
+/// One user_daily Parquet file.
+fn write_user_part(ctx: &Ctx, path: &Path, rows: &[URow]) {
+    let mut ids = Vec::with_capacity(rows.len() * 10);
+    let mut ends = Vec::with_capacity(rows.len());
+    let mut tops = Vec::new();
+    let mut tend = Vec::new();
+    let mut present = Vec::with_capacity(rows.len());
+    for r in rows {
+        keys::write_id(r.person, &mut ids);
+        ends.push(ids.len() as u32);
+        if r.top != NO_CAT {
+            tops.extend_from_slice(&ctx.cats[r.top as usize]);
+            tend.push(tops.len() as u32);
+            present.push(true);
+        } else {
+            present.push(false);
+        }
+    }
+    use parquet::{Column, Logical, Values};
+    let cols = vec![
+        Column { name: "user_id", logical: Logical::String, values: Values::Str { bytes: ids, ends }, present: None },
+        Column { name: "day", logical: Logical::Date, values: Values::I32(rows.iter().map(|r| r.day).collect()), present: None },
+        Column { name: "sessions", logical: Logical::None, values: Values::I32(rows.iter().map(|r| r.sessions as i32).collect()), present: None },
+        Column { name: "events", logical: Logical::None, values: Values::I32(rows.iter().map(|r| r.events as i32).collect()), present: None },
+        Column { name: "revenue_cents", logical: Logical::None, values: Values::I64(rows.iter().map(|r| r.revenue).collect()), present: None },
+        Column { name: "top_category", logical: Logical::String, values: Values::Str { bytes: tops, ends: tend }, present: Some(present) },
+    ];
+    parquet::write(path, rows.len(), &cols).expect("write user_daily");
+}
+
 // ------------------------------------------------------------------ lookups
 enum IdMap<V: Copy> {
     /// Every key is `prefix` + a decimal without leading zeros.
@@ -1363,7 +1425,11 @@ fn main() {
     };
     let sizes: Vec<usize> = (0..nq).map(psize).collect();
     order.sort_unstable_by_key(|&q| std::cmp::Reverse(sizes[q]));
-    let dstates = par(
+    let ud = out.join("user_daily");
+    let cd = out.join("campaign_daily");
+    std::fs::create_dir_all(&ud).unwrap();
+    std::fs::create_dir_all(&cd).unwrap();
+    let dstates = par_then(
         nthreads,
         nq,
         |_| DState {
@@ -1475,53 +1541,26 @@ fn main() {
             }
             st.scratch = Some(sc);
         },
-    );
-    lap("sessions");
-
-    // ---- E: write
-    let ud = out.join("user_daily");
-    let cd = out.join("campaign_daily");
-    std::fs::create_dir_all(&ud).unwrap();
-    std::fs::create_dir_all(&cd).unwrap();
-    let nonempty: Vec<usize> = (0..dstates.len()).filter(|&i| !dstates[i].urows.is_empty()).collect();
-    let files = if nonempty.is_empty() { vec![0] } else { nonempty };
-    par(nthreads, files.len(), |_| (), |_, fi| {
-        let rows = &dstates[files[fi]].urows;
-        let mut ids = Vec::with_capacity(rows.len() * 10);
-        let mut ends = Vec::with_capacity(rows.len());
-        let mut tops = Vec::new();
-        let mut tend = Vec::new();
-        let mut present = Vec::with_capacity(rows.len());
-        for r in rows {
-            keys::write_id(r.person, &mut ids);
-            ends.push(ids.len() as u32);
-            if r.top != NO_CAT {
-                tops.extend_from_slice(&ctx.cats[r.top as usize]);
-                tend.push(tops.len() as u32);
-                present.push(true);
-            } else {
-                present.push(false);
+        |st, t| {
+            // this thread's user_daily rows are final: write them while others finish
+            if !st.urows.is_empty() {
+                write_user_part(&ctx, &ud.join(format!("part-{t:05}.parquet")), &st.urows);
+                release(&st.urows);
             }
-        }
-        use parquet::{Column, Logical, Values};
-        let cols = vec![
-            Column { name: "user_id", logical: Logical::String, values: Values::Str { bytes: ids, ends }, present: None },
-            Column { name: "day", logical: Logical::Date, values: Values::I32(rows.iter().map(|r| r.day).collect()), present: None },
-            Column { name: "sessions", logical: Logical::None, values: Values::I32(rows.iter().map(|r| r.sessions as i32).collect()), present: None },
-            Column { name: "events", logical: Logical::None, values: Values::I32(rows.iter().map(|r| r.events as i32).collect()), present: None },
-            Column { name: "revenue_cents", logical: Logical::None, values: Values::I64(rows.iter().map(|r| r.revenue).collect()), present: None },
-            Column { name: "top_category", logical: Logical::String, values: Values::Str { bytes: tops, ends: tend }, present: Some(present) },
-        ];
-        parquet::write(&ud.join(format!("part-{fi:05}.parquet")), rows.len(), &cols).expect("write user_daily");
-        drop(cols);
-        release(rows);
-        if let Some(sc) = &dstates[files[fi]].scratch {
-            release(&sc.ev);
-            release(&sc.lid);
-            release(&sc.ck);
-            release(&sc.clid);
-        }
-    });
+            if let Some(sc) = &st.scratch {
+                release(&sc.ev);
+                release(&sc.lid);
+                release(&sc.ck);
+                release(&sc.clid);
+            }
+        },
+    );
+    lap("sessions + user_daily");
+
+    // ---- E: campaign_daily (user_daily parts were written by the D threads)
+    if dstates.iter().all(|s| s.urows.is_empty()) {
+        write_user_part(&ctx, &ud.join("part-00000.parquet"), &[]);
+    }
     {
         let mut cs = vec![0u64; ncamp * ndays];
         let mut cp = vec![0u64; ncamp * ndays];
