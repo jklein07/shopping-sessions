@@ -118,6 +118,24 @@ mod mapped {
         }
     }
 
+    /// Ask for transparent huge pages on a buffer that has not been touched yet (Linux only; a no-op
+    /// when THP is off). Fewer TLB misses for random lookups into big tables.
+    pub fn huge<T>(v: &[T]) {
+        #[cfg(target_os = "linux")]
+        {
+            const HUGE: usize = 2 << 20;
+            let start = v.as_ptr() as usize;
+            let end = start + std::mem::size_of_val(v);
+            let a = (start + HUGE - 1) & !(HUGE - 1);
+            let b = end & !(HUGE - 1);
+            if b > a && std::env::var_os("SS_NOHUGE").is_none() {
+                unsafe { madvise(a as *mut c_void, b - a, 14) }; // MADV_HUGEPAGE
+            }
+        }
+        #[cfg(not(target_os = "linux"))]
+        let _ = v;
+    }
+
     /// Give the whole pages inside a buffer that is never read again back to the kernel now, on this
     /// thread, so the exit (which frees memory on one core) has less to do. Linux only.
     #[inline]
@@ -137,7 +155,7 @@ mod mapped {
         let _ = v;
     }
 }
-use mapped::{release, Map};
+use mapped::{huge, release, Map};
 
 fn csv_files(dir: &Path) -> Vec<PathBuf> {
     let mut v: Vec<PathBuf> = match std::fs::read_dir(dir) {
@@ -373,12 +391,15 @@ const RING: usize = 16;
 impl LinkTable {
     fn new(min_cap: usize) -> Self {
         let cap = min_cap.next_power_of_two().max(1024);
-        LinkTable {
+        let t = LinkTable {
             slots: zeroed_atomic_u64(2 * cap),
             parent: zeroed_atomic_u32(cap),
             mask: cap - 1,
             shift: 64 - cap.trailing_zeros(),
-        }
+        };
+        huge(&t.slots);
+        huge(&t.parent);
+        t
     }
     #[inline(always)]
     fn home(&self, k: u64) -> usize {
