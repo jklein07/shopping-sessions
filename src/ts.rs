@@ -29,6 +29,48 @@ fn dim(y: i64, m: i64) -> i64 {
     }
 }
 
+/// First day of each month, 1970-01 .. 2100-01, as days since the epoch.
+const Y0: i64 = 1970;
+const YEARS: usize = 130;
+static MONTH_START: [i32; YEARS * 12 + 1] = {
+    let mut t = [0i32; YEARS * 12 + 1];
+    let mut i = 0;
+    while i <= YEARS * 12 {
+        let y = Y0 + (i / 12) as i64;
+        let m = (i % 12) as i64 + 1;
+        // days_from_civil(y, m, 1), written const-friendly
+        let yy = if m <= 2 { y - 1 } else { y };
+        let era = yy / 400;
+        let yoe = yy - era * 400;
+        let doy = (153 * ((m + 9) % 12) + 2) / 5;
+        let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
+        t[i] = (era * 146_097 + doe - 719_468) as i32;
+        i += 1;
+    }
+    t
+};
+
+/// Days since the epoch of a valid-or-not (y, mo, d), or None if impossible.
+#[inline(always)]
+fn civil_days(y: i64, mo: i64, d: i64) -> Option<i64> {
+    if mo < 1 || mo > 12 || d < 1 {
+        return None;
+    }
+    let i = (y - Y0) * 12 + mo - 1;
+    if i >= 0 && (i as usize) < YEARS * 12 {
+        let a = MONTH_START[i as usize] as i64;
+        let b = MONTH_START[i as usize + 1] as i64;
+        if d > b - a {
+            return None;
+        }
+        return Some(a + d - 1);
+    }
+    if d > dim(y, mo) {
+        return None;
+    }
+    Some(days_from_civil(y, mo, d))
+}
+
 /// Every byte of x is an ASCII digit.
 #[inline(always)]
 fn all_digits(x: u64) -> bool {
@@ -76,10 +118,11 @@ fn civil_prefix(s: &[u8]) -> Option<i64> {
     let h = ((ub >> 24) & 0xFF) as i64;
     let mi = ((ub >> 48) & 0xFF) as i64;
     let se = ((uc >> 8) & 0xFF) as i64;
-    if mo < 1 || mo > 12 || d < 1 || d > dim(y, mo) || h > 23 || mi > 59 || se > 59 {
+    if h > 23 || mi > 59 || se > 59 {
         return None;
     }
-    Some(((days_from_civil(y, mo, d) * 24 + h) * 60 + mi) * 60 + se)
+    let days = civil_days(y, mo, d)?;
+    Some(((days * 24 + h) * 60 + mi) * 60 + se)
 }
 
 /// Milliseconds since the epoch, or None for a bad timestamp. An all-digit F3
@@ -131,15 +174,16 @@ fn parse_f3(s: &[u8]) -> Option<i64> {
     if n == 0 {
         return None;
     }
-    if n <= 16 {
-        let mut buf = [b'0'; 16];
-        buf[16 - n..].copy_from_slice(s);
-        let hi = le8(&buf, 0);
-        let lo = le8(&buf, 8);
+    if (9..=16).contains(&n) {
+        // two overlapping 8-digit loads: digits 0..8 and n-8..n
+        let hi = le8(s, 0);
+        let lo = le8(s, n - 8);
         if !all_digits(hi) || !all_digits(lo) {
             return None;
         }
-        return Some((eight(hi) * 100_000_000 + eight(lo)) as i64);
+        const P10: [u64; 9] = [1, 10, 100, 1_000, 10_000, 100_000, 1_000_000, 10_000_000, 100_000_000];
+        let k = P10[n - 8];
+        return Some((eight(hi) * k + eight(lo) % k) as i64);
     }
     let mut v: u64 = 0;
     let mut sig = 0usize;
@@ -238,7 +282,8 @@ mod tests {
         let alphabet = b"0123456789-T:Z+ z.e";
         for _ in 0..2_000_000 {
             let r = next();
-            let mut s: Vec<u8> = match r % 4 {
+            let mut s: Vec<u8> = match r % 5 {
+                4 => format!("{:0w$}", (r >> 8) % 100_000_000_000_000_000, w = ((r >> 3) % 20) as usize).into_bytes(),
                 0 => format!("{:04}-{:02}-{:02}T{:02}:{:02}:{:02}Z", r % 10000, (r >> 14) % 14, (r >> 18) % 33, (r >> 24) % 26, (r >> 30) % 62, (r >> 36) % 62).into_bytes(),
                 1 => format!("{:04}-{:02}-{:02}T{:02}:{:02}:{:02}{}{:02}:{:02}", 2000 + r % 40, 1 + (r >> 14) % 12, 1 + (r >> 18) % 31, (r >> 24) % 24, (r >> 30) % 60, (r >> 36) % 60, if r >> 63 == 1 { '+' } else { '-' }, (r >> 42) % 26, (r >> 48) % 62).into_bytes(),
                 2 => ((r >> 3) % 10_000_000_000_000_000).to_string().into_bytes(),

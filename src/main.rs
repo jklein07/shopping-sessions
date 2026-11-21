@@ -28,7 +28,7 @@ const GAP: u32 = 30 * 60 * 1000;
 const REACH: i64 = 7 * DAY;
 const LATE: i64 = DAY;
 const INVALID: u32 = u32::MAX;
-const PBITS: u32 = 9;
+const PBITS: u32 = 10;
 const QBITS: u32 = 9;
 const NO_CAT: u8 = 255;
 const CHUNK: usize = 4 << 20;
@@ -244,6 +244,8 @@ struct Ctx {
     campaigns: IdMap<u32>,
     camp_ids: Vec<Vec<u8>>,
     camp_chan: Vec<Vec<u8>>,
+    /// Persons with more clicks than this count assists by intervals.
+    interval_clicks: usize,
 }
 
 fn manifest_value(text: &str, name: &str) -> String {
@@ -399,18 +401,32 @@ fn parse_price(s: &[u8]) -> Option<u32> {
 }
 
 // ------------------------------------------------------------------ person map
+#[derive(Default)]
 struct PMap {
     keys: Vec<u64>,
     vals: Vec<u32>,
+    used: Vec<u32>,
     mask: usize,
     shift: u32,
     len: usize,
 }
 
 impl PMap {
+    /// Empty the map, keeping (or growing to) room for `expected` keys.
+    fn reset(&mut self, expected: usize) {
+        for &i in &self.used {
+            self.keys[i as usize] = 0;
+        }
+        self.used.clear();
+        self.len = 0;
+        let cap = (expected * 2).next_power_of_two().max(64);
+        if self.keys.len() < cap {
+            *self = PMap::new(expected);
+        }
+    }
     fn new(expected: usize) -> Self {
         let cap = (expected * 2).next_power_of_two().max(64);
-        PMap { keys: vec![0; cap], vals: vec![0; cap], mask: cap - 1, shift: 64 - cap.trailing_zeros(), len: 0 }
+        PMap { keys: vec![0; cap], vals: vec![0; cap], used: Vec::new(), mask: cap - 1, shift: 64 - cap.trailing_zeros(), len: 0 }
     }
     #[inline(always)]
     fn home(&self, k: u64) -> usize {
@@ -431,6 +447,7 @@ impl PMap {
                 }
                 self.keys[i] = k;
                 self.vals[i] = self.len as u32;
+                self.used.push(i as u32);
                 self.len += 1;
                 return self.vals[i];
             }
@@ -459,6 +476,7 @@ impl PMap {
         self.vals = vec![0; cap];
         self.mask = cap - 1;
         self.shift = 64 - cap.trailing_zeros();
+        self.used.clear();
         for (k, v) in old_k.into_iter().zip(old_v) {
             if k != 0 {
                 let mut i = self.home(k);
@@ -467,6 +485,7 @@ impl PMap {
                 }
                 self.keys[i] = k;
                 self.vals[i] = v;
+                self.used.push(i as u32);
             }
         }
     }
@@ -484,6 +503,27 @@ struct DState {
     serial: u32,
     catsum: Vec<i64>,
     touched: Vec<u8>,
+    scratch: Option<Scratch>,
+    starts: Vec<u32>,
+    days: Vec<u32>,
+    day_end: Vec<u32>,
+    camp_ts: Vec<u64>,
+}
+
+#[derive(Default)]
+struct Scratch {
+    pmap: PMap,
+    lid: Vec<u32>,
+    counts: Vec<u32>,
+    names: Vec<u64>,
+    off: Vec<u32>,
+    fill: Vec<u32>,
+    ev: Vec<u64>,
+    ccount: Vec<u32>,
+    clid: Vec<u32>,
+    coff: Vec<u32>,
+    cfill: Vec<u32>,
+    ck: Vec<Click>,
 }
 
 fn sort_events(v: &mut [u64]) {
@@ -512,6 +552,10 @@ fn process_person(ctx: &Ctx, person: u64, ev: &[u64], ck: &[Click], st: &mut DSt
     let ndays = ctx.ndays;
     let organic = ctx.camp_ids.len();
     let n = ev.len();
+    // Many clicks: count assists by merged click intervals after the sessions are known.
+    let by_interval = ck.len() > ctx.interval_clicks;
+    st.starts.clear();
+    st.days.clear();
     let (mut lo, mut hi) = (0usize, 0usize);
     let mut cur_day = usize::MAX;
     let (mut d_sessions, mut d_events, mut d_rev) = (0u32, 0u32, 0i64);
@@ -555,6 +599,10 @@ fn process_person(ctx: &Ctx, person: u64, ev: &[u64], ck: &[Click], st: &mut DSt
         d_sessions += 1;
         d_events += (j - i) as u32;
         d_rev += rev;
+        if by_interval {
+            st.starts.push(start);
+            st.days.push(day as u32);
+        }
         // attribution
         while hi < ck.len() && ck[hi].ts <= start {
             hi += 1;
@@ -568,7 +616,7 @@ fn process_person(ctx: &Ctx, person: u64, ev: &[u64], ck: &[Click], st: &mut DSt
         st.c_sessions[idx] += 1;
         st.c_purch[idx] += purchased as u64;
         st.c_rev[idx] += rev;
-        if lo < hi {
+        if lo < hi && !by_interval {
             st.serial = st.serial.wrapping_add(1);
             if st.serial == 0 {
                 st.stamp.iter_mut().for_each(|s| *s = 0);
@@ -588,6 +636,64 @@ fn process_person(ctx: &Ctx, person: u64, ev: &[u64], ck: &[Click], st: &mut DSt
     if cur_day != usize::MAX {
         flush_day(ctx, person, cur_day, d_sessions, d_events, d_rev, st);
     }
+    if by_interval {
+        assists_by_interval(ndays, ck, st);
+    }
+}
+
+/// Assists for a person with many clicks: a click at t assists every session
+/// starting in [t, t + 7 days]. Per campaign, merge the overlapping click
+/// intervals and count the sessions inside each merged interval per day.
+fn assists_by_interval(ndays: usize, ck: &[Click], st: &mut DState) {
+    let reach = REACH as u64;
+    let starts = std::mem::take(&mut st.starts);
+    let days = std::mem::take(&mut st.days);
+    let ns = starts.len();
+    // end of each session's day run
+    let mut day_end = std::mem::take(&mut st.day_end);
+    day_end.clear();
+    day_end.resize(ns, 0);
+    let mut k = ns;
+    while k > 0 {
+        k -= 1;
+        day_end[k] = if k + 1 < ns && days[k + 1] == days[k] { day_end[k + 1] } else { (k + 1) as u32 };
+    }
+    let mut cl = std::mem::take(&mut st.camp_ts);
+    cl.clear();
+    cl.extend(ck.iter().map(|c| ((c.camp as u64) << 32) | c.ts as u64));
+    cl.sort_unstable();
+    let add = |camp: usize, lo_t: u64, hi_t: u64, st: &mut DState| {
+        let mut a = starts.partition_point(|&s| (s as u64) < lo_t);
+        let b = starts.partition_point(|&s| (s as u64) <= hi_t);
+        while a < b {
+            let e = (day_end[a] as usize).min(b);
+            st.c_assist[camp * ndays + days[a] as usize] += (e - a) as u64;
+            a = e;
+        }
+    };
+    let mut i = 0;
+    while i < cl.len() {
+        let camp = (cl[i] >> 32) as usize;
+        let mut lo_t = cl[i] & 0xFFFF_FFFF;
+        let mut hi_t = lo_t + reach;
+        i += 1;
+        while i < cl.len() && (cl[i] >> 32) as usize == camp {
+            let t = cl[i] & 0xFFFF_FFFF;
+            if t <= hi_t {
+                hi_t = hi_t.max(t + reach);
+            } else {
+                add(camp, lo_t, hi_t, st);
+                lo_t = t;
+                hi_t = t + reach;
+            }
+            i += 1;
+        }
+        add(camp, lo_t, hi_t, st);
+    }
+    st.camp_ts = cl;
+    st.day_end = day_end;
+    st.starts = starts;
+    st.days = days;
 }
 
 fn flush_day(ctx: &Ctx, person: u64, day: usize, sessions: u32, events: u32, revenue: i64, st: &mut DState) {
@@ -663,6 +769,58 @@ fn bench(path: &str) {
         });
         n
     });
+    let prod: Vec<(Vec<u8>, u8)> = (1..=50000).map(|i| (format!("p{i}").into_bytes(), (i % 20) as u8)).collect();
+    let products = IdMap::build(&prod, b"p", 20u8);
+    let ws = ts::parse(b"2027-12-11T00:00:00Z").unwrap();
+    let we = ws + 14 * DAY;
+    let base = ws - REACH;
+    for (name, level) in [("handler", 0u32), ("+push", 1), ("-ingest", 2), ("-ts", 3), ("-product", 4)] {
+        let products = &products;
+        run(name, &|| {
+            let mut parts: Vec<Vec<ERec>> = (0..512).map(|_| Vec::with_capacity(64)).collect();
+            let mut acc = 0u64;
+            csv::scan::<7>(&data, 0, data.len(), |buf, f, ok| {
+                if !ok || f[0].0 == f[0].1 {
+                    return;
+                }
+                let fld = |i: usize| &buf[f[i].0..f[i].1];
+                let ek = keys::key(fld(0));
+                let ingest = if level == 2 { 0 } else { ts::parse(fld(3)).unwrap_or(i64::MAX) };
+                let mut tsv = INVALID;
+                let mut pc = 0u32;
+                let mut uk = 0u64;
+                'v: {
+                    let uid = fld(1);
+                    let pid = fld(5);
+                    if uid.is_empty() || pid.is_empty() {
+                        break 'v;
+                    }
+                    let ty = fld(4);
+                    let purchase = match ty.len() {
+                        4 if ty == b"view" || ty == b"cart" => false,
+                        8 if ty == b"purchase" => true,
+                        _ => break 'v,
+                    };
+                    let t = if level == 3 { ws + 1000 } else { match ts::parse(fld(2)) { Some(t) => t, None => break 'v } };
+                    if t < ws || t >= we || ingest.saturating_sub(t) > LATE {
+                        break 'v;
+                    }
+                    let price = if purchase { match parse_price(fld(6)) { Some(v) => v, None => break 'v } } else { 0 };
+                    let cat = if level == 4 { 1 } else { products.get(pid) };
+                    tsv = (t - base) as u32;
+                    pc = (price << 8) | cat as u32;
+                    uk = keys::key(uid);
+                }
+                let r = ERec { eid: ek, person: uk, ingest, ts: tsv, pc };
+                if level == 1 {
+                    parts[(keys::hash(ek) >> (64 - PBITS)) as usize].push(r);
+                } else {
+                    acc = acc.wrapping_add(r.eid ^ r.person ^ r.ingest as u64 ^ r.ts as u64 ^ r.pc as u64);
+                }
+            });
+            acc + parts.iter().map(|p| p.len() as u64).sum::<u64>()
+        });
+    }
 }
 
 fn main() {
@@ -711,7 +869,8 @@ fn main() {
     let camp_chan: Vec<Vec<u8>> = camp_pairs.iter().map(|(_, ch)| ch.clone()).collect();
     let camp: Vec<(Vec<u8>, u32)> = camp_ids.iter().enumerate().map(|(i, c)| (c.clone(), i as u32)).collect();
     let campaigns = IdMap::build(&camp, b"c_", u32::MAX);
-    let ctx = Ctx { ws, we, base, day0, ndays, cats, products, campaigns, camp_ids, camp_chan };
+    let interval_clicks = std::env::var("SS_INTERVAL_CLICKS").ok().and_then(|v| v.parse().ok()).unwrap_or(256);
+    let ctx = Ctx { ws, we, base, day0, ndays, cats, products, campaigns, camp_ids, camp_chan, interval_clicks };
 
     let ev_files = csv_files(&data.join("events"));
     let ck_files = csv_files(&data.join("clicks"));
@@ -973,63 +1132,65 @@ fn main() {
     struct CState {
         pp: Vec<Vec<PRec>>,
         keys: Vec<u64>,
-        best: Vec<(i64, u32, u32)>,
+        idx: Vec<u32>,
         touched: Vec<u32>,
     }
     let pp_reserve = ev_bytes / 75 / nthreads / nq + 64;
+    let sbits = (usize::BITS - (nthreads.max(2) - 1).leading_zeros()).max(1);
+    let rbits = 32 - sbits;
     let cstates = par(
         nthreads,
         np,
         |_| CState {
             pp: (0..nq).map(|_| Vec::with_capacity(pp_reserve)).collect(),
             keys: Vec::new(),
-            best: Vec::new(),
+            idx: Vec::new(),
             touched: Vec::new(),
         },
         |st, p| {
             let slices: Vec<&[ERec]> = bstates.iter().map(|s| &s.ep[p][..]).collect();
             let n: usize = slices.iter().map(|s| s.len()).sum();
-            let tbits = (n * 2).next_power_of_two().max(64).trailing_zeros();
+            let tbits = (n + n / 2).next_power_of_two().max(64).trailing_zeros();
             let cap = 1usize << tbits;
             if st.keys.len() < cap {
                 st.keys = vec![0; cap];
-                st.best = vec![(0, 0, 0); cap];
+                st.idx = vec![0; cap];
             }
             let mask = cap - 1;
+            let rec = |g: u32| -> &ERec { &slices[(g >> rbits) as usize][(g & ((1 << rbits) - 1)) as usize] };
             for (si, s) in slices.iter().enumerate() {
+                assert!(s.len() < (1usize << rbits), "partition too large");
                 for (ri, r) in s.iter().enumerate() {
+                    let g = ((si as u32) << rbits) | ri as u32;
                     let h = keys::hash(r.eid);
                     let mut i = ((h << PBITS) >> (64 - tbits)) as usize;
                     loop {
                         let k = st.keys[i];
-                        if k == r.eid {
-                            if r.ingest < st.best[i].0 {
-                                st.best[i] = (r.ingest, si as u32, ri as u32);
-                            }
-                            break;
-                        }
                         if k == 0 {
                             st.keys[i] = r.eid;
-                            st.best[i] = (r.ingest, si as u32, ri as u32);
+                            st.idx[i] = g;
                             st.touched.push(i as u32);
+                            break;
+                        }
+                        if k == r.eid {
+                            if r.ingest < rec(st.idx[i]).ingest {
+                                st.idx[i] = g;
+                            }
                             break;
                         }
                         i = (i + 1) & mask;
                     }
                 }
             }
-            let touched = std::mem::take(&mut st.touched);
-            for &i in &touched {
+            for &i in &st.touched {
                 let i = i as usize;
-                let (_, si, ri) = st.best[i];
                 st.keys[i] = 0;
-                let r = &slices[si as usize][ri as usize];
+                let r = rec(st.idx[i]);
                 if r.ts != INVALID {
                     let q = (keys::hash2(r.person) >> (64 - QBITS)) as usize;
                     st.pp[q].push(PRec { person: r.person, ts: r.ts, pc: r.pc });
                 }
             }
-            st.touched = touched;
             st.touched.clear();
         },
     );
@@ -1050,81 +1211,97 @@ fn main() {
             serial: 0,
             catsum: vec![0; 256],
             touched: Vec::new(),
+            scratch: Some(Scratch::default()),
+            starts: Vec::new(),
+            days: Vec::new(),
+            day_end: Vec::new(),
+            camp_ts: Vec::new(),
         },
         |st, q| {
+            let mut sc = st.scratch.take().unwrap();
             let slices: Vec<&[PRec]> = cstates.iter().map(|s| &s.pp[q][..]).collect();
             let n: usize = slices.iter().map(|s| s.len()).sum();
-            let mut pmap = PMap::new(n / 8 + 16);
-            let mut lid = Vec::with_capacity(n);
-            let mut counts: Vec<u32> = Vec::new();
-            let mut names: Vec<u64> = Vec::new();
+            sc.pmap.reset(n / 8 + 16);
+            sc.lid.clear();
+            sc.counts.clear();
+            sc.names.clear();
             for s in &slices {
                 for r in s.iter() {
-                    let l = pmap.get_or_insert(r.person);
-                    if l as usize == counts.len() {
-                        counts.push(0);
-                        names.push(r.person);
+                    let l = sc.pmap.get_or_insert(r.person);
+                    if l as usize == sc.counts.len() {
+                        sc.counts.push(0);
+                        sc.names.push(r.person);
                     }
-                    counts[l as usize] += 1;
-                    lid.push(l);
+                    sc.counts[l as usize] += 1;
+                    sc.lid.push(l);
                 }
             }
-            let np_ = counts.len();
-            let mut off = vec![0u32; np_ + 1];
+            let np_ = sc.counts.len();
+            sc.off.clear();
+            sc.off.push(0);
             for i in 0..np_ {
-                off[i + 1] = off[i] + counts[i];
+                let v = sc.off[i] + sc.counts[i];
+                sc.off.push(v);
             }
-            let mut fill = off.clone();
-            let mut ev = vec![0u64; n];
+            sc.fill.clear();
+            sc.fill.extend_from_slice(&sc.off);
+            sc.ev.clear();
+            sc.ev.resize(n, 0);
             let mut k = 0;
             for s in &slices {
                 for r in s.iter() {
-                    let l = lid[k] as usize;
+                    let l = sc.lid[k] as usize;
                     k += 1;
-                    ev[fill[l] as usize] = ((r.ts as u64) << 32) | r.pc as u64;
-                    fill[l] += 1;
+                    sc.ev[sc.fill[l] as usize] = ((r.ts as u64) << 32) | r.pc as u64;
+                    sc.fill[l] += 1;
                 }
             }
             // clicks of these persons
             let cslices: Vec<&[CRec]> = bstates.iter().map(|s| &s.cp[q][..]).collect();
-            let mut ccount = vec![0u32; np_ + 1];
-            let mut clid: Vec<u32> = Vec::new();
+            sc.ccount.clear();
+            sc.ccount.resize(np_ + 1, 0);
+            sc.clid.clear();
             for s in &cslices {
                 for c in s.iter() {
-                    let l = pmap.get(c.person).unwrap_or(u32::MAX);
-                    clid.push(l);
+                    let l = sc.pmap.get(c.person).unwrap_or(u32::MAX);
+                    sc.clid.push(l);
                     if l != u32::MAX {
-                        ccount[l as usize] += 1;
+                        sc.ccount[l as usize] += 1;
                     }
                 }
             }
-            let mut coff = vec![0u32; np_ + 1];
+            sc.coff.clear();
+            sc.coff.push(0);
             for i in 0..np_ {
-                coff[i + 1] = coff[i] + ccount[i];
+                let v = sc.coff[i] + sc.ccount[i];
+                sc.coff.push(v);
             }
-            let mut cfill = coff.clone();
-            let mut ck = vec![Click { ts: 0, camp: 0, cid: 0 }; coff[np_] as usize];
+            sc.cfill.clear();
+            sc.cfill.extend_from_slice(&sc.coff);
+            sc.ck.clear();
+            sc.ck.resize(sc.coff[np_] as usize, Click { ts: 0, camp: 0, cid: 0 });
             let mut k = 0;
             for s in &cslices {
                 for c in s.iter() {
-                    let l = clid[k];
+                    let l = sc.clid[k];
                     k += 1;
                     if l != u32::MAX {
                         let l = l as usize;
-                        ck[cfill[l] as usize] = Click { ts: c.ts, camp: c.camp, cid: c.cid };
-                        cfill[l] += 1;
+                        sc.ck[sc.cfill[l] as usize] = Click { ts: c.ts, camp: c.camp, cid: c.cid };
+                        sc.cfill[l] += 1;
                     }
                 }
             }
             for l in 0..np_ {
-                let e = &mut ev[off[l] as usize..off[l + 1] as usize];
+                let e = &mut sc.ev[sc.off[l] as usize..sc.off[l + 1] as usize];
                 sort_events(e);
-                let c = &mut ck[coff[l] as usize..coff[l + 1] as usize];
+                let c = &mut sc.ck[sc.coff[l] as usize..sc.coff[l + 1] as usize];
                 if c.len() > 1 {
                     c.sort_unstable_by(click_order);
                 }
-                process_person(&ctx, names[l], e, c, st);
+                process_person(&ctx, sc.names[l], e, c, st);
             }
+            st.scratch = Some(sc);
         },
     );
     lap("sessions");

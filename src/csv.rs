@@ -110,6 +110,82 @@ fn first_line(data: &[u8], s: usize) -> Option<usize> {
     }
 }
 
+/// Split one line that starts at `ls` using a 128-byte window (needs
+/// `ls + 128 <= data.len()`). None if the line is longer than the window.
+#[inline(always)]
+fn line_fast<const N: usize>(data: &[u8], ls: usize, f: &mut Fields<N>) -> Option<(usize, bool)> {
+    let (c0, q0, n0) = classify(data[ls..ls + 64].try_into().unwrap());
+    let (c1, q1, n1) = classify(data[ls + 64..ls + 128].try_into().unwrap());
+    let nl = n0 as u128 | (n1 as u128) << 64;
+    if nl == 0 {
+        return None;
+    }
+    let end = nl.trailing_zeros();
+    let below = (1u128 << end) - 1;
+    let commas = (c0 as u128 | (c1 as u128) << 64) & below;
+    let next = ls + end as usize + 1;
+    if commas.count_ones() as usize != N - 1 {
+        return Some((next, false));
+    }
+    let q = (q0 as u128 | (q1 as u128) << 64) & below;
+    let mut sep = commas | (1u128 << end);
+    if q == 0 {
+        let mut start = 0u32;
+        for fi in f.iter_mut() {
+            let p = sep.trailing_zeros();
+            sep &= sep - 1;
+            *fi = (ls + start as usize, ls + p as usize);
+            start = p + 1;
+        }
+        return Some((next, true));
+    }
+    let mut start = 0u32;
+    let mut bad = false;
+    for fi in f.iter_mut() {
+        let p = sep.trailing_zeros();
+        sep &= sep - 1;
+        // quotes inside [start, p)
+        let range = ((1u128 << p) - 1) & !((1u128 << start) - 1);
+        let inner = q & range;
+        let quoted = inner != 0;
+        let edges = (1u128 << start) | (1u128 << p.saturating_sub(1));
+        bad |= quoted & (inner != edges || p < start + 2);
+        let d = quoted as u32;
+        *fi = (ls + (start + d) as usize, ls + (p - d.min(p)) as usize);
+        start = p + 1;
+    }
+    Some((next, !bad))
+}
+
+/// The general path: any line length, and a last line without `\n`.
+fn line_slow<const N: usize>(data: &[u8], ls: usize, f: &mut Fields<N>) -> (usize, bool) {
+    let len = data.len();
+    let end = data[ls..].iter().position(|&c| c == b'\n').map_or(len, |i| ls + i);
+    let mut nf = 0usize;
+    let mut bad = false;
+    let mut fs = ls;
+    for p in ls..=end {
+        if p == end || data[p] == b',' {
+            let field = &data[fs..p];
+            let nq = field.iter().filter(|&&c| c == b'"').count();
+            let (a, b) = if nq == 0 {
+                (fs, p)
+            } else if nq == 2 && field.len() >= 2 && field[0] == b'"' && field[field.len() - 1] == b'"' {
+                (fs + 1, p - 1)
+            } else {
+                bad = true;
+                (fs, p)
+            };
+            if nf < N {
+                f[nf] = (a, b);
+            }
+            nf += 1;
+            fs = p + 1;
+        }
+    }
+    (end + 1, !bad && nf == N)
+}
+
 /// Calls `line(data, fields, ok)` for every data line that starts in [s, e)
 /// of a file. `ok` is false for a malformed line (fields are then unspecified).
 /// A final line without `\n` is still a line.
@@ -120,64 +196,19 @@ pub fn scan<const N: usize>(data: &[u8], s: usize, e: usize, mut line: impl FnMu
         Some(p) => p,
         None => return,
     };
-    if ls >= e || ls >= len {
-        return;
-    }
     let mut fields: Fields<N> = [(0, 0); N];
-    let mut nf = 0usize;
-    let mut bad = false;
-    let mut fs = ls; // current field start
-    let mut qc_fs = 0u32; // quotes seen before fs (relative count)
-    let mut qbase = 0u32; // quotes seen before the current block
-    let mut blk = ls;
-    let mut pad: [u8; 64];
-    loop {
-        let (comma, quote, nl) = if blk + 64 <= len {
-            classify(data[blk..blk + 64].try_into().unwrap())
-        } else {
-            if blk >= len {
-                return;
+    let stop = e.min(len);
+    while ls < stop {
+        if ls + 128 <= len {
+            if let Some((next, ok)) = line_fast(data, ls, &mut fields) {
+                line(data, &fields, ok);
+                ls = next;
+                continue;
             }
-            let rest = len - blk;
-            pad = [0u8; 64];
-            pad[..rest].copy_from_slice(&data[blk..]);
-            if data[len - 1] != b'\n' {
-                pad[rest] = b'\n'; // the unterminated last line ends at len
-            }
-            classify(&pad)
-        };
-        let mut m = comma | nl;
-        while m != 0 {
-            let off = m.trailing_zeros();
-            let p = blk + off as usize;
-            let qc = qbase + (quote & ((1u64 << off) - 1)).count_ones();
-            let nq = qc - qc_fs;
-            if nf < N {
-                if nq == 0 {
-                    fields[nf] = (fs, p);
-                } else if nq == 2 && data[fs] == b'"' && data[p - 1] == b'"' {
-                    fields[nf] = (fs + 1, p - 1);
-                } else {
-                    bad = true;
-                }
-            }
-            nf += 1;
-            if (nl >> off) & 1 != 0 {
-                line(data, &fields, !bad && nf == N);
-                nf = 0;
-                bad = false;
-                ls = p + 1;
-                if ls >= e || ls >= len {
-                    return;
-                }
-            }
-            fs = p + 1;
-            qc_fs = qc;
-            m &= m - 1;
         }
-        qbase += quote.count_ones();
-        blk += 64;
-        let _ = ls;
+        let (next, ok) = line_slow(data, ls, &mut fields);
+        line(data, &fields, ok);
+        ls = next;
     }
 }
 
@@ -220,7 +251,7 @@ mod tests {
         let mut data = b"h1,h2\n".to_vec();
         let mut want = Vec::new();
         for i in 0..500 {
-            let a = "x".repeat(i % 97);
+            let a = "x".repeat(i % 197);
             let line = format!("{a}{i},\"q{i}\"");
             want.push((format!("{a}{i}"), format!("q{i}")));
             data.extend_from_slice(line.as_bytes());
