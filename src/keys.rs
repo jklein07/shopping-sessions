@@ -44,17 +44,24 @@ pub fn pack(s: &[u8]) -> Option<u64> {
     Some((x << 7) | b8)
 }
 
+#[inline(always)]
 fn unpack(k: u64, out: &mut Vec<u8>) {
     let b8 = (k & 0x7F) as u8;
     let mut x = k >> 7;
     x = (x & 0x0FFF_FFFF) | ((x & 0x00FF_FFFF_F000_0000) << 4);
     x = (x & 0x0000_3FFF_0000_3FFF) | ((x & 0x0FFF_C000_0FFF_C000) << 2);
     x = (x & 0x007F_007F_007F_007F) | ((x & 0x3F80_3F80_3F80_3F80) << 1);
-    for &b in x.to_be_bytes().iter().chain(std::iter::once(&b8)) {
-        if b == 0 {
-            break;
-        }
-        out.push(b);
+    // the ID is the nonzero prefix of x's big-endian bytes, then b8 when all 8 are set
+    let n = if x & 0xFF != 0 { 8 + (b8 != 0) as usize } else { 8 - (x.trailing_zeros() / 8) as usize };
+    let mut buf = [0u8; 16];
+    buf[..8].copy_from_slice(&x.to_be_bytes());
+    buf[8] = b8;
+    out.reserve(16);
+    // SAFETY: 16 bytes of spare capacity were reserved; only the first n become part of the Vec.
+    unsafe {
+        let len = out.len();
+        std::ptr::copy_nonoverlapping(buf.as_ptr(), out.as_mut_ptr().add(len), 16);
+        out.set_len(len + n);
     }
 }
 
@@ -89,6 +96,7 @@ pub fn key(s: &[u8]) -> u64 {
 }
 
 /// Append the ID a key stands for.
+#[inline]
 pub fn write_id(k: u64, out: &mut Vec<u8>) {
     if k & WEIRD != 0 {
         let strings = WEIRD_STRINGS.read().unwrap();
@@ -141,6 +149,27 @@ mod tests {
         }
         for bad in [&b""[..], b"abcdefghij", b"a\x00b", b"\x80", b"abcdefgh\x00", b"\xc3\xa9"] {
             assert!(pack(bad).is_none(), "{:?}", bad);
+        }
+    }
+    #[test]
+    fn round_trip_random() {
+        let mut st = 0x9e37_79b9_7f4a_7c15u64;
+        let mut rnd = move || {
+            st ^= st << 13;
+            st ^= st >> 7;
+            st ^= st << 17;
+            st
+        };
+        let mut out = Vec::new();
+        for _ in 0..1_000_000 {
+            let n = 1 + (rnd() % 9) as usize;
+            let id: Vec<u8> = (0..n).map(|_| 1 + (rnd() % 127) as u8).collect();
+            let pre = (rnd() % 5) as usize;
+            out.clear();
+            out.extend(std::iter::repeat(b'#').take(pre));
+            write_id(pack(&id).unwrap(), &mut out);
+            assert_eq!(&out[pre..], &id[..]);
+            assert!(out[..pre].iter().all(|&c| c == b'#'));
         }
     }
 }

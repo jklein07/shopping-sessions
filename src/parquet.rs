@@ -105,37 +105,54 @@ fn physical(v: &Values) -> i32 {
     }
 }
 
+/// The little-endian bytes of a slice of integers (the in-memory layout on every target we build).
+fn le_bytes<T>(x: &[T]) -> &[u8] {
+    #[cfg(not(target_endian = "little"))]
+    compile_error!("little-endian targets only");
+    // SAFETY: plain integers, no padding; the byte view covers exactly the slice.
+    unsafe { std::slice::from_raw_parts(x.as_ptr() as *const u8, std::mem::size_of_val(x)) }
+}
+
 fn encode_values(v: &Values, out: &mut Vec<u8>) {
     match v {
-        Values::I32(x) => {
-            out.reserve(x.len() * 4);
-            for &a in x {
-                out.extend_from_slice(&a.to_le_bytes());
-            }
-        }
-        Values::I64(x) => {
-            out.reserve(x.len() * 8);
-            for &a in x {
-                out.extend_from_slice(&a.to_le_bytes());
-            }
-        }
+        Values::I32(x) => out.extend_from_slice(le_bytes(x)),
+        Values::I64(x) => out.extend_from_slice(le_bytes(x)),
         Values::Str { bytes, ends } => {
-            out.reserve(bytes.len() + ends.len() * 4);
+            // each value: u32 length, then the bytes; short values copied 16 bytes at a time
+            let total = bytes.len() + ends.len() * 4;
+            out.reserve(total + 16);
+            let base = out.len();
+            let dst = out.as_mut_ptr();
+            let mut w = base;
             let mut s = 0usize;
             for &e in ends {
                 let e = e as usize;
-                out.extend_from_slice(&((e - s) as u32).to_le_bytes());
-                out.extend_from_slice(&bytes[s..e]);
+                let n = e - s;
+                // SAFETY: w + 4 + n <= base + total, and at most 16 bytes past that were reserved.
+                unsafe {
+                    std::ptr::copy_nonoverlapping((n as u32).to_le_bytes().as_ptr(), dst.add(w), 4);
+                    if n <= 16 && s + 16 <= bytes.len() {
+                        std::ptr::copy_nonoverlapping(bytes.as_ptr().add(s), dst.add(w + 4), 16);
+                    } else {
+                        std::ptr::copy_nonoverlapping(bytes.as_ptr().add(s), dst.add(w + 4), n);
+                    }
+                }
+                w += 4 + n;
                 s = e;
             }
+            assert_eq!(w, base + total);
+            // SAFETY: every byte in base..w was written above.
+            unsafe { out.set_len(w) };
         }
     }
 }
 
 /// Write a file with one row group holding `rows` rows.
 pub fn write(path: &std::path::Path, rows: usize, cols: &[Column]) -> std::io::Result<()> {
-    let mut file: Vec<u8> = Vec::new();
-    file.extend_from_slice(b"PAR1");
+    // pages go straight to the file; only headers and the footer are built in memory
+    let mut f = File::create(path)?;
+    f.write_all(b"PAR1")?;
+    let mut pos = 4i64;
     struct Meta {
         offset: i64,
         size: i64,
@@ -168,11 +185,20 @@ pub fn write(path: &std::path::Path, rows: usize, cols: &[Column]) -> std::io::R
             page.extend_from_slice(&(rle.len() as u32).to_le_bytes());
             page.extend_from_slice(&rle);
         }
-        encode_values(&c.values, &mut page);
+        // a required integer column is written from the values themselves, without a copy
+        let direct: Option<&[u8]> = match (&c.values, &c.present) {
+            (Values::I32(x), None) => Some(le_bytes(x)),
+            (Values::I64(x), None) => Some(le_bytes(x)),
+            _ => None,
+        };
+        if direct.is_none() {
+            encode_values(&c.values, &mut page);
+        }
+        let body: &[u8] = direct.unwrap_or(&page);
         let mut h = Thrift::new();
         h.i32(1, 0); // DATA_PAGE
-        h.i32(2, page.len() as i32);
-        h.i32(3, page.len() as i32);
+        h.i32(2, body.len() as i32);
+        h.i32(3, body.len() as i32);
         h.struct_field(5);
         h.i32(1, rows as i32);
         h.i32(2, 0); // PLAIN
@@ -180,10 +206,11 @@ pub fn write(path: &std::path::Path, rows: usize, cols: &[Column]) -> std::io::R
         h.i32(4, 3); // RLE
         h.end();
         h.buf.push(0);
-        let offset = file.len() as i64;
-        file.extend_from_slice(&h.buf);
-        file.extend_from_slice(&page);
-        metas.push(Meta { offset, size: (h.buf.len() + page.len()) as i64, nvalues: rows as i64 });
+        let offset = pos;
+        f.write_all(&h.buf)?;
+        f.write_all(body)?;
+        pos += (h.buf.len() + body.len()) as i64;
+        metas.push(Meta { offset, size: (h.buf.len() + body.len()) as i64, nvalues: rows as i64 });
     }
     // FileMetaData
     let mut t = Thrift::new();
@@ -222,10 +249,10 @@ pub fn write(path: &std::path::Path, rows: usize, cols: &[Column]) -> std::io::R
         t.list(4, T_STRUCT, 0);
         t.binary(6, b"shopping-sessions");
         t.buf.push(0);
-        file.extend_from_slice(&t.buf);
-        file.extend_from_slice(&(t.buf.len() as u32).to_le_bytes());
-        file.extend_from_slice(b"PAR1");
-        return File::create(path)?.write_all(&file);
+        let n = t.buf.len() as u32;
+        t.buf.extend_from_slice(&n.to_le_bytes());
+        t.buf.extend_from_slice(b"PAR1");
+        return f.write_all(&t.buf);
     }
     t.list(4, T_STRUCT, 1);
     t.begin();
@@ -256,10 +283,9 @@ pub fn write(path: &std::path::Path, rows: usize, cols: &[Column]) -> std::io::R
     t.end();
     t.binary(6, b"shopping-sessions");
     t.buf.push(0);
-    file.extend_from_slice(&t.buf);
-    file.extend_from_slice(&(t.buf.len() as u32).to_le_bytes());
-    file.extend_from_slice(b"PAR1");
-    let mut f = File::create(path)?;
-    f.write_all(&file)?;
+    let n = t.buf.len() as u32;
+    t.buf.extend_from_slice(&n.to_le_bytes());
+    t.buf.extend_from_slice(b"PAR1");
+    f.write_all(&t.buf)?;
     Ok(())
 }
