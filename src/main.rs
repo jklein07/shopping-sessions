@@ -249,7 +249,44 @@ fn dense_num(s: &[u8], prefix: &[u8]) -> Option<usize> {
     Some(v)
 }
 
+/// `dense_num(&buf[a..b], prefix)` without a digit loop: one 8-byte load that ends at `b`.
+#[inline(always)]
+fn dense_num_at(buf: &[u8], a: usize, b: usize, prefix: &[u8]) -> Option<usize> {
+    if b < 8 {
+        return dense_num(&buf[a..b], prefix);
+    }
+    let n = prefix.len();
+    let len = b - a;
+    if len <= n || len > n + 7 || buf[a + n] == b'0' {
+        return None;
+    }
+    for i in 0..n {
+        if buf[a + i] != prefix[i] {
+            return None;
+        }
+    }
+    let k = len - n; // 1..=7 digits, in the top k bytes of the load
+    let x = u64::from_le_bytes(buf[b - 8..b].try_into().unwrap());
+    let keep = !0u64 << (8 * (8 - k));
+    let x = (x & keep) | (ts::ZEROS & !keep);
+    if !ts::all_digits(x) {
+        return None;
+    }
+    Some(ts::eight(x) as usize)
+}
+
 impl<V: Copy> IdMap<V> {
+    /// The value of the key `buf[a..b]`, or the absent value.
+    #[inline(always)]
+    fn get_at(&self, buf: &[u8], a: usize, b: usize) -> V {
+        match self {
+            IdMap::Dense { prefix, table, absent } => match dense_num_at(buf, a, b, prefix) {
+                Some(n) if n < table.len() => table[n],
+                _ => *absent,
+            },
+            IdMap::Hash { map, absent } => map.get(&buf[a..b]).copied().unwrap_or(*absent),
+        }
+    }
     fn build(pairs: &[(Vec<u8>, V)], prefix: &'static [u8], absent: V) -> Self {
         if pairs.iter().all(|(k, _)| dense_num(k, prefix).is_some()) {
             let max = pairs.iter().map(|(k, _)| dense_num(k, prefix).unwrap()).max().unwrap_or(0);
@@ -260,16 +297,6 @@ impl<V: Copy> IdMap<V> {
             IdMap::Dense { prefix, table, absent }
         } else {
             IdMap::Hash { map: pairs.iter().cloned().collect(), absent }
-        }
-    }
-    #[inline(always)]
-    fn get(&self, s: &[u8]) -> V {
-        match self {
-            IdMap::Dense { prefix, table, absent } => match dense_num(s, prefix) {
-                Some(n) if n < table.len() => table[n],
-                _ => *absent,
-            },
-            IdMap::Hash { map, absent } => map.get(s).copied().unwrap_or(*absent),
         }
     }
 }
@@ -890,7 +917,7 @@ fn bench(path: &str) {
                         break 'v;
                     }
                     let price = if purchase { match parse_price(fld(6)) { Some(v) => v, None => break 'v } } else { 0 };
-                    let cat = if level == 4 { 1 } else { products.get(pid) };
+                    let cat = if level == 4 { 1 } else { products.get_at(buf, f[5].0, f[5].1) };
                     tsv = (t - base) as u32;
                     pc = (price << 8) | cat as u32;
                     uk = keys::key(uid);
@@ -1186,7 +1213,7 @@ fn main() {
                         } else {
                             0
                         };
-                        let cat = ctx.products.get(pid);
+                        let cat = ctx.products.get_at(buf, f[5].0, f[5].1);
                         tsv = (t - ctx.base) as u32;
                         pc = (price << 8) | cat as u32;
                         uk = keys::key(uid);
@@ -1208,7 +1235,7 @@ fn main() {
                         return;
                     }
                     let fld = |i: usize| &buf[f[i].0..f[i].1];
-                    let camp = ctx.campaigns.get(fld(2));
+                    let camp = ctx.campaigns.get_at(buf, f[2].0, f[2].1);
                     if camp == u32::MAX {
                         return;
                     }
@@ -1535,4 +1562,42 @@ fn main() {
     }
     // The OS reclaims everything; skip destructors of the big buffers.
     std::process::exit(0);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn dense_num_at_matches_dense_num() {
+        let mut seed = 0x1234_5678_9abc_def0u64;
+        let mut rnd = move || {
+            seed ^= seed << 13;
+            seed ^= seed >> 7;
+            seed ^= seed << 17;
+            seed
+        };
+        let alphabet = b"0123456789pc_x\"9";
+        for _ in 0..2_000_000 {
+            let pad = (rnd() % 12) as usize;
+            let len = (rnd() % 11) as usize;
+            let mut buf: Vec<u8> = (0..pad).map(|_| alphabet[(rnd() % alphabet.len() as u64) as usize]).collect();
+            let a = buf.len();
+            let style = rnd() % 4;
+            for i in 0..len {
+                let c = match style {
+                    0 => alphabet[(rnd() % alphabet.len() as u64) as usize],
+                    _ if i == 0 => b'p',
+                    1 if i == 1 => b'_',
+                    _ => b'0' + (rnd() % 10) as u8,
+                };
+                buf.push(c);
+            }
+            let b = buf.len();
+            buf.extend_from_slice(b",x\n");
+            for prefix in [&b"p"[..], &b"c_"[..], &b"p_"[..]] {
+                assert_eq!(dense_num_at(&buf, a, b, prefix), dense_num(&buf[a..b], prefix), "{:?}", std::str::from_utf8(&buf[a..b]));
+            }
+        }
+    }
 }

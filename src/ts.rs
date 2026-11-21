@@ -7,7 +7,7 @@ pub const MINUTE: i64 = 60 * SECOND;
 pub const HOUR: i64 = 60 * MINUTE;
 pub const DAY: i64 = 24 * HOUR;
 
-const ZEROS: u64 = 0x3030_3030_3030_3030;
+pub(crate) const ZEROS: u64 = 0x3030_3030_3030_3030;
 
 #[inline(always)]
 pub fn days_from_civil(y: i64, m: i64, d: i64) -> i64 {
@@ -73,7 +73,7 @@ fn civil_days(y: i64, mo: i64, d: i64) -> Option<i64> {
 
 /// Every byte of x is an ASCII digit.
 #[inline(always)]
-fn all_digits(x: u64) -> bool {
+pub(crate) fn all_digits(x: u64) -> bool {
     const HI: u64 = 0xF0F0_F0F0_F0F0_F0F0;
     (x & HI) == ZEROS && (x.wrapping_add(0x0606_0606_0606_0606) & HI) == ZEROS
 }
@@ -159,7 +159,7 @@ pub fn parse(s: &[u8]) -> Option<i64> {
 }
 
 #[inline(always)]
-fn eight(x: u64) -> u64 {
+pub(crate) fn eight(x: u64) -> u64 {
     // x: 8 ASCII digits, first (most significant) in the lowest byte
     let v = pairs(x);
     let v = ((v & 0x0000_00FF_0000_00FF).wrapping_mul(100 + (1_000_000u64 << 32))
@@ -182,8 +182,10 @@ fn parse_f3(s: &[u8]) -> Option<i64> {
             return None;
         }
         const P10: [u64; 9] = [1, 10, 100, 1_000, 10_000, 100_000, 1_000_000, 10_000_000, 100_000_000];
-        let k = P10[n - 8];
-        return Some((eight(hi) * k + eight(lo) % k) as i64);
+        // zero the digits `lo` shares with `hi` (its low 16 - n bytes) instead of dividing
+        let keep = !0u64 << (8 * (16 - n));
+        let lo = (lo & keep) | (ZEROS & !keep);
+        return Some((eight(hi) * P10[n - 8] + eight(lo)) as i64);
     }
     let mut v: u64 = 0;
     let mut sig = 0usize;
