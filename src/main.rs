@@ -140,11 +140,16 @@ mod mapped {
     /// thread, so the exit (which frees memory on one core) has less to do. Linux only.
     #[inline]
     pub fn release<T>(v: &Vec<T>) {
+        release_raw(v.as_ptr() as *const u8, v.capacity() * std::mem::size_of::<T>());
+    }
+
+    /// `release` for a raw byte range.
+    pub fn release_raw(p: *const u8, len: usize) {
         #[cfg(target_os = "linux")]
         {
             const PAGE: usize = 4096;
-            let start = v.as_ptr() as usize;
-            let end = start + v.capacity() * std::mem::size_of::<T>();
+            let start = p as usize;
+            let end = start + len;
             let a = (start + PAGE - 1) & !(PAGE - 1);
             let b = end & !(PAGE - 1);
             if b > a {
@@ -152,10 +157,10 @@ mod mapped {
             }
         }
         #[cfg(not(target_os = "linux"))]
-        let _ = v;
+        let _ = (p, len);
     }
 }
-use mapped::{huge, release, Map};
+use mapped::{huge, release, release_raw, Map};
 
 fn csv_files(dir: &Path) -> Vec<PathBuf> {
     let mut v: Vec<PathBuf> = match std::fs::read_dir(dir) {
@@ -206,6 +211,67 @@ impl Countdown {
         if self.0[file].fetch_sub(1, AcqRel) == 1 {
             maps[file].unmap();
         }
+    }
+}
+
+// ------------------------------------------------------------------ partition buffers
+/// One thread's records, split into `np` partitions, in a single 2 MB-aligned block that asks for
+/// transparent huge pages: partition p fills its own segment of `seg` records, then spills into an
+/// ordinary Vec. Compared with one Vec per partition this takes about 500x fewer page faults (each
+/// costly inside a VM) and far fewer TLB misses in the scatter.
+struct Parts<T: Copy> {
+    base: *mut T,
+    seg: usize,
+    len: Vec<u32>,
+    spill: Vec<Vec<T>>,
+    layout: std::alloc::Layout,
+}
+unsafe impl<T: Copy + Send> Send for Parts<T> {}
+unsafe impl<T: Copy + Sync> Sync for Parts<T> {}
+
+impl<T: Copy> Parts<T> {
+    fn new(np: usize, seg: usize) -> Self {
+        let seg = seg.max(1);
+        let bytes = (np * seg * std::mem::size_of::<T>()).next_multiple_of(2 << 20);
+        let layout = std::alloc::Layout::from_size_align(bytes, 2 << 20).unwrap();
+        // SAFETY: nonzero size; the memory is only read where it was written (below `len`).
+        let base = unsafe { std::alloc::alloc(layout) } as *mut T;
+        assert!(!base.is_null(), "out of memory");
+        // SAFETY: the block is fresh and untouched
+        huge(unsafe { std::slice::from_raw_parts(base as *const u8, bytes) });
+        Parts { base, seg, len: vec![0; np], spill: (0..np).map(|_| Vec::new()).collect(), layout }
+    }
+    #[inline(always)]
+    fn push(&mut self, p: usize, x: T) {
+        let l = self.len[p] as usize;
+        if l < self.seg {
+            // SAFETY: p < np and l < seg, inside the block
+            unsafe { self.base.add(p * self.seg + l).write(x) };
+            self.len[p] = l as u32 + 1;
+        } else {
+            self.spill[p].push(x);
+        }
+    }
+    /// The records of partition p: its segment, then its spill.
+    fn part(&self, p: usize) -> [&[T]; 2] {
+        // SAFETY: the first len[p] records of the segment were written by push
+        let main = unsafe { std::slice::from_raw_parts(self.base.add(p * self.seg), self.len[p] as usize) };
+        [main, &self.spill[p][..]]
+    }
+    fn count(&self, p: usize) -> usize {
+        self.len[p] as usize + self.spill[p].len()
+    }
+    /// Return the block's pages to the kernel now (on this thread); the records must not be read again.
+    fn release(&self) {
+        // SAFETY: the block is valid for layout.size() bytes
+        release_raw(self.base as *const u8, self.layout.size());
+    }
+}
+
+impl<T: Copy> Drop for Parts<T> {
+    fn drop(&mut self) {
+        // SAFETY: allocated in new with this layout
+        unsafe { std::alloc::dealloc(self.base as *mut u8, self.layout) };
     }
 }
 
@@ -1130,8 +1196,9 @@ fn main() {
     let ck_bytes: usize = ck_maps.iter().map(|m| m.bytes().len()).sum();
     let np = 1usize << PBITS;
     let nq = 1usize << QBITS;
-    let ev_reserve = ev_bytes / 70 / nthreads / np + 64;
-    let ck_reserve = ck_bytes / 40 / nthreads / nq + 64;
+    // segment sizes: the expected records per thread and partition, with headroom (more spill)
+    let ev_reserve = ev_bytes / 70 / nthreads / np * 13 / 10 + 32;
+    let ck_reserve = ck_bytes / 40 / nthreads / nq * 3 / 2 + 32;
     #[derive(Clone, Copy)]
     enum Job {
         Union(usize),
@@ -1169,8 +1236,8 @@ fn main() {
         }
     };
     struct BState {
-        ep: Vec<Vec<ERec>>,
-        cp: Vec<Vec<CRec>>,
+        ep: Parts<ERec>,
+        cp: Parts<CRec>,
         cring: [(CRec, usize); RING],
         cn: usize,
     }
@@ -1190,7 +1257,7 @@ fn main() {
         #[inline(always)]
         fn push_click(&mut self, links: &LinkTable, mut c: CRec, slot: usize) {
             c.person = links.person_at(slot, c.person);
-            self.cp[(keys::hash2(c.person) >> (64 - QBITS)) as usize].push(c);
+            self.cp.push((keys::hash2(c.person) >> (64 - QBITS)) as usize, c);
         }
         fn flush(&mut self, links: &LinkTable) {
             let n = self.cn.min(RING);
@@ -1206,8 +1273,8 @@ fn main() {
         nthreads,
         jobs.len(),
         |_| BState {
-            ep: (0..np).map(|_| Vec::with_capacity(ev_reserve)).collect(),
-            cp: (0..nq).map(|_| Vec::with_capacity(ck_reserve)).collect(),
+            ep: Parts::new(np, ev_reserve),
+            cp: Parts::new(nq, ck_reserve),
             cring: [(C0, 0); RING],
             cn: 0,
         },
@@ -1326,7 +1393,7 @@ fn main() {
                         uk = keys::key(uid);
                     }
                     // person holds the user's ID key here; dedup resolves it
-                    st.ep[(keys::hash(ek) >> (64 - PBITS)) as usize].push(ERec { eid: ek, person: uk, ingest, ts: tsv, pc });
+                    st.ep.push((keys::hash(ek) >> (64 - PBITS)) as usize, ERec { eid: ek, person: uk, ingest, ts: tsv, pc });
                 });
                 ev_left.done(t.file, ev_maps);
             }
@@ -1363,25 +1430,26 @@ fn main() {
 
     // ---- C: dedup per event_id partition, repartition by person
     struct CState {
-        pp: Vec<Vec<PRec>>,
+        pp: Parts<PRec>,
         keys: Vec<u64>,
         idx: Vec<u32>,
         touched: Vec<u32>,
     }
-    let pp_reserve = ev_bytes / 75 / nthreads / nq + 64;
-    let sbits = (usize::BITS - (nthreads.max(2) - 1).leading_zeros()).max(1);
+    let pp_reserve = ev_bytes / 75 / nthreads / nq * 13 / 10 + 32;
+    // record ids: slice (segment or spill of each parse thread) and index within it
+    let sbits = (usize::BITS - (2 * nthreads - 1).leading_zeros()).max(1);
     let rbits = 32 - sbits;
     let cstates = par(
         nthreads,
         np,
         |_| CState {
-            pp: (0..nq).map(|_| Vec::with_capacity(pp_reserve)).collect(),
+            pp: Parts::new(nq, pp_reserve),
             keys: Vec::new(),
             idx: Vec::new(),
             touched: Vec::new(),
         },
         |st, p| {
-            let slices: Vec<&[ERec]> = bstates.iter().map(|s| &s.ep[p][..]).collect();
+            let slices: Vec<&[ERec]> = bstates.iter().flat_map(|s| s.ep.part(p)).collect();
             let n: usize = slices.iter().map(|s| s.len()).sum();
             let tbits = (n + n / 2).next_power_of_two().max(64).trailing_zeros();
             let cap = 1usize << tbits;
@@ -1419,9 +1487,9 @@ fn main() {
             // lookups prefetched RING records ahead
             let mut ring = [(0u64, 0u32, 0u32, 0usize); RING];
             let mut n = 0usize;
-            let emit = |pp: &mut Vec<Vec<PRec>>, (user, ts, pc, slot): (u64, u32, u32, usize)| {
+            let emit = |pp: &mut Parts<PRec>, (user, ts, pc, slot): (u64, u32, u32, usize)| {
                 let person = links.person_at(slot, user);
-                pp[(keys::hash2(person) >> (64 - QBITS)) as usize].push(PRec { person, ts, pc });
+                pp.push((keys::hash2(person) >> (64 - QBITS)) as usize, PRec { person, ts, pc });
             };
             for &i in &st.touched {
                 let i = i as usize;
@@ -1442,9 +1510,6 @@ fn main() {
                 emit(&mut st.pp, ring[k % RING]);
             }
             st.touched.clear();
-            for s in &bstates {
-                release(&s.ep[p]);
-            }
         },
     );
     lap("dedup");
@@ -1454,7 +1519,7 @@ fn main() {
     // largest partitions first, so a whale's partition does not finish last
     let mut order: Vec<usize> = (0..nq).collect();
     let psize = |q: usize| -> usize {
-        cstates.iter().map(|s| s.pp[q].len()).sum::<usize>() + bstates.iter().map(|s| s.cp[q].len()).sum::<usize>()
+        cstates.iter().map(|s| s.pp.count(q)).sum::<usize>() + bstates.iter().map(|s| s.cp.count(q)).sum::<usize>()
     };
     let sizes: Vec<usize> = (0..nq).map(psize).collect();
     order.sort_unstable_by_key(|&q| std::cmp::Reverse(sizes[q]));
@@ -1465,7 +1530,12 @@ fn main() {
     let dstates = par_then(
         nthreads,
         nq,
-        |_| DState {
+        |t| {
+            // dedup is done with the event records: give their pages back, one block per thread
+            if let Some(b) = bstates.get(t) {
+                b.ep.release();
+            }
+            DState {
             urows: Vec::new(),
             c_sessions: vec![0; ncamp * ndays],
             c_purch: vec![0; ncamp * ndays],
@@ -1480,11 +1550,12 @@ fn main() {
             days: Vec::new(),
             day_end: Vec::new(),
             camp_ts: Vec::new(),
+            }
         },
         |st, qi| {
             let q = order[qi];
             let mut sc = st.scratch.take().unwrap();
-            let slices: Vec<&[PRec]> = cstates.iter().map(|s| &s.pp[q][..]).collect();
+            let slices: Vec<&[PRec]> = cstates.iter().flat_map(|s| s.pp.part(q)).collect();
             let n: usize = slices.iter().map(|s| s.len()).sum();
             sc.pmap.reset(n / 8 + 16);
             sc.lid.clear();
@@ -1522,7 +1593,7 @@ fn main() {
                 }
             }
             // clicks of these persons
-            let cslices: Vec<&[CRec]> = bstates.iter().map(|s| &s.cp[q][..]).collect();
+            let cslices: Vec<&[CRec]> = bstates.iter().flat_map(|s| s.cp.part(q)).collect();
             sc.ccount.clear();
             sc.ccount.resize(np_ + 1, 0);
             sc.clid.clear();
@@ -1565,12 +1636,6 @@ fn main() {
                     c.sort_unstable_by(click_order);
                 }
                 process_person(&ctx, sc.names[l], e, c, st);
-            }
-            for s in &cstates {
-                release(&s.pp[q]);
-            }
-            for s in &bstates {
-                release(&s.cp[q]);
             }
             st.scratch = Some(sc);
         },
