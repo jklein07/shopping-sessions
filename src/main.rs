@@ -998,7 +998,12 @@ fn main() {
         let (nev, nck) = (ev_files.len(), ck_files.len());
         let all_files: Vec<PathBuf> = ev_files.iter().chain(&ck_files).chain(&ln_files).cloned().collect();
         let slots: Vec<std::sync::Mutex<Option<Map>>> = all_files.iter().map(|_| std::sync::Mutex::new(None)).collect();
-        par(nthreads, all_files.len(), |_| (), |_, i| {
+        // Open (and ask the kernel to read ahead) in the order the phases use the files: links,
+        // then events, then clicks. With a cold page cache the links arrive first.
+        let nf = all_files.len();
+        let order: Vec<usize> = (nev + nck..nf).chain(0..nev + nck).collect();
+        par(nthreads, nf, |_| (), |_, k| {
+            let i = order[k];
             *slots[i].lock().unwrap() = Some(Map::open(&all_files[i]));
         });
         let maps: Vec<Map> = slots.into_iter().map(|m| m.into_inner().unwrap().unwrap()).collect();
