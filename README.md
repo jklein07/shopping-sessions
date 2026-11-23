@@ -2,6 +2,8 @@
 
 Entry for the Builders Buildathon **Databricks · Shopping Sessions** track (team *fortnite pirate token*).
 
+**Result:** placed **357th of 408 teams** in the final (30.1 s on the hidden data set; 1.25 s on practice).
+
 It reads the messy click-stream CSVs in `$DATA_DIR` (`/data`), applies every rule in the track's `rules.md`
 (CSV dialect, timestamp forms, linked IDs, dedup before validation, late events, 30-minute sessions,
 last-click attribution with 7-day assists), and writes `user_daily/` and `campaign_daily/` as Parquet under
